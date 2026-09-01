@@ -277,7 +277,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const modelSpan = Math.max(spanX, spanZ);
   const center = new THREE.Vector3(xC, yC, zC);
 
-  const terrainMesh = buildTerrain(terrain, geometries, materials);
+  const terrainMesh = buildTerrain(terrain, geometries, materials, roadMesh);
   scene.add(terrainMesh.mesh);
   scene.add(terrainMesh.skirt);
   if (terrainMesh.lodSkirt) scene.add(terrainMesh.lodSkirt);
@@ -1027,7 +1027,7 @@ function parseTerrain(buf) {
 // ────────────────────────────────────────────────────────────────────────
 // terrain mesh + skirt + bilinear sampler
 // ────────────────────────────────────────────────────────────────────────
-function buildTerrain(terrain, geometries, materials) {
+function buildTerrain(terrain, geometries, materials, roadMesh) {
   const { header, heights, width, height } = terrain;
   const originE = header.originE, originN = header.originN, cell = header.cell;
   const x0 = header.minE - originE;
@@ -1048,10 +1048,32 @@ function buildTerrain(terrain, geometries, materials) {
   // full res (via one level of 8×8 quadrant subdivision). Normals come from
   // the full grid so shading is identical across LOD levels. LOD skirts fill
   // T-junction cracks at mixed-res borders.
-  const ERROR_T = 0.10;          // metres — tile flatness tolerance
+  const ERROR_T = 1.5;           // metres — open-fell flatness tolerance (tuned)
   const TILE = 16;               // cells per tile
   const HALF = TILE / 2;         // 8×8 quadrant
   const SKIRT_DEPTH = 0.30;      // LOD crack skirt
+
+  // Recess-aware protection: a global flatness threshold cannot both decimate
+  // the bumpy fell AND preserve the 0.2 m road recesses (their signal is below
+  // any threshold big enough to flatten the fell). So mark grid cells the road
+  // passes through (±1 halo) and force those tiles full-res — recesses stay
+  // crisp while the open fell decimates hard. Buildings sink 2 m into terrain
+  // (foundation rule) so their contact is buried and needs no protection.
+  const prot = new Uint8Array(width * height);
+  if (roadMesh && roadMesh.positions) {
+    const P = roadMesh.positions;
+    for (let i = 0; i < P.length; i += 3) {
+      const c = Math.round((P[i] - x0) / cell), r = Math.round((P[i + 2] - z0) / cell);
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        const rr = r + dr, cc = c + dc;
+        if (rr >= 0 && rr < height && cc >= 0 && cc < width) prot[rr * width + cc] = 1;
+      }
+    }
+  }
+  function hasProt(r0, c0, r1, c1) {
+    for (let r = r0; r <= r1; r++) { const base = r * width; for (let c = c0; c <= c1; c++) if (prot[base + c]) return true; }
+    return false;
+  }
   const cCream = new THREE.Color(PAL.terrainCream);
   const cSage = new THREE.Color(PAL.terrainSage);
   const span = Math.max(1e-6, header.zMax - header.zMin);
@@ -1129,13 +1151,13 @@ function buildTerrain(terrain, geometries, materials) {
     const r1 = Math.min(r0 + TILE, height - 1);
     for (let c0 = 0; c0 < width - 1; c0 += TILE) {
       const c1 = Math.min(c0 + TILE, width - 1);
-      if (regionError(r0, c0, r1, c1) < ERROR_T) { decimate(r0, c0, r1, c1); nDec++; }
+      if (!hasProt(r0, c0, r1, c1) && regionError(r0, c0, r1, c1) < ERROR_T) { decimate(r0, c0, r1, c1); nDec++; }
       else {
         const rM = Math.min(r0 + HALF, r1), cM = Math.min(c0 + HALF, c1);
         for (const q of [[r0, c0, rM, cM], [r0, cM, rM, c1], [rM, c0, r1, cM], [rM, cM, r1, c1]]) {
           const [qr0, qc0, qr1, qc1] = q;
           if (qr1 <= qr0 || qc1 <= qc0) continue;   // edge remainder
-          if (regionError(qr0, qc0, qr1, qc1) < ERROR_T) { decimate(qr0, qc0, qr1, qc1); nDec++; }
+          if (!hasProt(qr0, qc0, qr1, qc1) && regionError(qr0, qc0, qr1, qc1) < ERROR_T) { decimate(qr0, qc0, qr1, qc1); nDec++; }
           else { fullRes(qr0, qc0, qr1, qc1); nFull++; }
         }
       }
