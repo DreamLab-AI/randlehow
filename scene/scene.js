@@ -285,6 +285,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   scene.add(terrainMesh.mesh);
   scene.add(terrainMesh.skirt);
   const sampleHeight = terrainMesh.sampleHeight;
+  if (typeof window !== 'undefined') { window.__terrain = terrainMesh.mesh; window.__sceneObj = scene; window.__cam = camera; } // TEMP debug
 
   // terrain-albedo.png (contracts §2.1a): baked cream + road paint, solves
   // subpixel ribbon aliasing at overview. Sibling of terrain.bin. Applied as
