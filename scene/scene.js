@@ -283,9 +283,9 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const meshData = await fetchTerrainMesh(terrainUrl.replace(/[^/]+$/, 'terrain-mesh.bin'));
   const terrainMesh = buildTerrain(terrain, geometries, materials, roadMesh, meshData);
   scene.add(terrainMesh.mesh);
-  scene.add(terrainMesh.skirt);
+  if (terrainMesh.skirt) scene.add(terrainMesh.skirt);
   const sampleHeight = terrainMesh.sampleHeight;
-  if (typeof window !== 'undefined') { window.__terrain = terrainMesh.mesh; window.__sceneObj = scene; window.__cam = camera; } // TEMP debug
+  if (typeof window !== 'undefined') window.__rlhwDebug = { scene, camera, terrainMesh: terrainMesh.mesh }; // TEMP debug
 
   // terrain-albedo.png (contracts §2.1a): baked cream + road paint, solves
   // subpixel ribbon aliasing at overview. Sibling of terrain.bin. Applied as
@@ -327,9 +327,13 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
   const sc = sun.shadow.camera;
-  const half = modelSpan * 0.62;
+  // Bounds must cover the whole model's projection in light-space for ANY sun
+  // angle (perpendicular extent ≤ bounding radius ≈ 0.7·modelSpan; the low sun
+  // stretches the along-light depth, so far is generous). Too-small bounds =
+  // fragments outside the frustum render fully shadowed → the "dark band" bug.
+  const half = modelSpan * 0.85;
   sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
-  sc.near = 1; sc.far = modelSpan * 2.2;
+  sc.near = 1; sc.far = modelSpan * 3.5;
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.6;
   scene.add(sun);
@@ -415,12 +419,26 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const pickTargetsTerrain = [terrainMesh.mesh];
   let roadOutline = null;           // polygon ring [x,z] for snapping
   let roadVerts = null;             // Float32 positions for corridor snapping
+  let coreBounds = null;            // bbox of the RANDLEHOW (hero) road for framing
   if (roadMesh && roadMesh.positions && roadMesh.positions.length) {
     const roadObj = buildRoad(roadMesh, geometries, materials);
     scene.add(roadObj);
     pickTargetsTerrain.push(roadObj);
     roadOutline = Array.isArray(roadMesh.outline) ? roadMesh.outline : null;
     roadVerts = roadMesh.positions;
+    // Frame the HERO road only. The v2 network's public/track/path branches run
+    // to the terrain edges; framing their full bbox pulls the camera way back
+    // off the corridor. Restrict to the "randlehow" group's vertices.
+    const p = roadMesh.positions, idx = roadMesh.indices;
+    const g = (roadMesh.groups || []).find(x => x.kind === 'randlehow');
+    if (g && idx) {
+      let mnx = Infinity, mxx = -Infinity, mnz = Infinity, mxz = -Infinity;
+      for (let k = g.start; k < g.start + g.count; k++) {
+        const vi = idx[k], x = p[vi * 3], z = p[vi * 3 + 2];
+        if (x < mnx) mnx = x; if (x > mxx) mxx = x; if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+      }
+      if (mnx < mxx) coreBounds = { cx: (mnx + mxx) / 2, cz: (mnz + mxz) / 2, span: Math.max(mxx - mnx, mxz - mnz) };
+    }
   }
 
   // ---- pins ------------------------------------------------------------
@@ -498,17 +516,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // camera framing + tween
   // ════════════════════════════════════════════════════════════════════
   function frameWhole() {
-    // Frame the ROAD CORRIDOR tightly (the pin cluster spans it), from SE, sun-lit.
+    // Frame the HERO (randlehow) corridor tightly, from SE, sun-lit.
     let fx = xC, fz = zC, fy = yC, fspan = modelSpan;
-    if (roadVerts && roadVerts.length) {
-      let mnx = Infinity, mxx = -Infinity, mnz = Infinity, mxz = -Infinity;
-      for (let i = 0; i < roadVerts.length; i += 3) {
-        const x = roadVerts[i], z = roadVerts[i + 2];
-        if (x < mnx) mnx = x; if (x > mxx) mxx = x;
-        if (z < mnz) mnz = z; if (z > mxz) mxz = z;
-      }
-      fx = (mnx + mxx) / 2; fz = (mnz + mxz) / 2;
-      fspan = Math.max(mxx - mnx, mxz - mnz) * 1.2;   // pad a touch
+    if (coreBounds) {
+      fx = coreBounds.cx; fz = coreBounds.cz;
+      fspan = coreBounds.span * 1.35;   // pad so the hero road + its houses fit
       const sh = sampleHeight(fx, fz); fy = Number.isFinite(sh) ? sh + 6 : yC;
     }
     const dist = fspan * 0.9;
@@ -1127,13 +1139,23 @@ function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
   // full-grid normals + planar UVs) if the bake isn't present. The full 2 m
   // grid remains authoritative for sampleHeight/pick/ghost either way.
   function geoFromRLHM(md) {
+    // De-interleave into plain attributes + explicit bounds (standard/robust;
+    // pick/ghost/snap raycast the terrain, so avoid any interleaved-attr quirks).
+    const vd = md.vertexData, vc = md.header.vertCount;
+    const pos = new Float32Array(vc * 3), nrm = new Float32Array(vc * 3), uv = new Float32Array(vc * 2);
+    for (let i = 0; i < vc; i++) {
+      const o = i * 8;
+      pos[i * 3] = vd[o]; pos[i * 3 + 1] = vd[o + 1]; pos[i * 3 + 2] = vd[o + 2];
+      nrm[i * 3] = vd[o + 3]; nrm[i * 3 + 1] = vd[o + 4]; nrm[i * 3 + 2] = vd[o + 5];
+      uv[i * 2] = vd[o + 6]; uv[i * 2 + 1] = vd[o + 7];
+    }
     const g = new THREE.BufferGeometry();
-    const ib = new THREE.InterleavedBuffer(md.vertexData, 8); // [pos3, normal3, uv2]
-    g.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0));
-    g.setAttribute('normal', new THREE.InterleavedBufferAttribute(ib, 3, 3));
-    g.setAttribute('uv', new THREE.InterleavedBufferAttribute(ib, 2, 6));
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
     g.setIndex(new THREE.BufferAttribute(md.indexData, 1));
     g.computeBoundingSphere();
+    g.computeBoundingBox();
     return g;
   }
   function buildFullGridGeo() {
@@ -1178,14 +1200,15 @@ function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
   }
 
   // ---- plinth skirt ---------------------------------------------------
-  // Island mesh (§2.1b rev 4a): the boundary is organic (corner trims), so a
-  // rectangular plinth would mismatch. Instead hug the ACTUAL mesh boundary —
-  // extrude the boundary edges (used by one triangle) straight down. This turns
-  // any visible boundary into an intentional model edge, not a torn cut.
-  // Full-grid fallback keeps the rectangular plinth (its boundary IS the rect).
+  // RLHM island (§2.1b rev 4a): NO plinth. The boundary-edge-extrusion is
+  // RETIRED — the baked mesh is not cleanly watertight, so hundreds of internal
+  // edges got flagged as boundary and extruded into curtains that OCCLUDED the
+  // terrain (this was the live "dark band" + "roads invisible" defect). Per
+  // owner rev4a, fog + camera clamps dissolve the organic edge instead. The
+  // full-grid fallback keeps its rectangular skirt (that mesh IS watertight).
   const baseY = header.zMin - Math.max(8, (header.zMax - header.zMin) * 0.4);
   const skirt = usedMesh
-    ? buildBoundaryPlinth(meshData, baseY, geometries, materials)
+    ? null
     : buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials);
 
   // ---- bilinear sampler in scene coords ----
@@ -1201,49 +1224,6 @@ function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
   }
 
   return { mesh, skirt, sampleHeight };
-}
-
-// Plinth that hugs the RLHM mesh's actual boundary (organic island). Boundary
-// edges = edges referenced by exactly one triangle; extrude each down to baseY.
-function buildBoundaryPlinth(md, baseY, geometries, materials) {
-  const idx = md.indexData, vd = md.vertexData, S = 8;
-  const key = (a, b) => (a < b ? a * 8388608 + b : b * 8388608 + a); // verts < 8.4M
-  const count = new Map();
-  for (let t = 0; t < idx.length; t += 3) {
-    const a = idx[t], b = idx[t + 1], c = idx[t + 2];
-    count.set(key(a, b), (count.get(key(a, b)) || 0) + 1);
-    count.set(key(b, c), (count.get(key(b, c)) || 0) + 1);
-    count.set(key(c, a), (count.get(key(c, a)) || 0) + 1);
-  }
-  const pos = [], col = [];
-  const cTop = new THREE.Color(PAL.skirt), cBot = new THREE.Color(PAL.skirtBottom);
-  const emit = (i, j) => {
-    const ix = vd[i * S], iy = vd[i * S + 1], iz = vd[i * S + 2];
-    const jx = vd[j * S], jy = vd[j * S + 1], jz = vd[j * S + 2];
-    // two tris: (i, j, i↓) and (j, j↓, i↓)
-    pos.push(ix, iy, iz, jx, jy, jz, ix, baseY, iz);
-    pos.push(jx, jy, jz, jx, baseY, jz, ix, baseY, iz);
-    for (let q = 0; q < 2; q++) { col.push(cTop.r, cTop.g, cTop.b); }
-    col.push(cBot.r, cBot.g, cBot.b);
-    col.push(cTop.r, cTop.g, cTop.b);
-    for (let q = 0; q < 2; q++) { col.push(cBot.r, cBot.g, cBot.b); }
-  };
-  for (let t = 0; t < idx.length; t += 3) {
-    const a = idx[t], b = idx[t + 1], c = idx[t + 2];
-    if (count.get(key(a, b)) === 1) emit(a, b);
-    if (count.get(key(b, c)) === 1) emit(b, c);
-    if (count.get(key(c, a)) === 1) emit(c, a);
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
-  g.computeVertexNormals();
-  geometries.add(g);
-  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1.0, metalness: 0, side: THREE.DoubleSide });
-  materials.add(m);
-  const mesh = new THREE.Mesh(g, m);
-  mesh.receiveShadow = true; mesh.castShadow = false;
-  return mesh;
 }
 
 function buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials) {
