@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Randlehow scene.js — dev harness</title>
+<style>
+  :root { --paper:#e8e4da; --ink:#3a352c; --panel:#f7f4ec; --edge:#cfc8b6; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; color: var(--ink); }
+  #app { display: grid; grid-template-columns: 260px 1fr; height: 100vh; }
+  #panel { background: var(--panel); border-right: 1px solid var(--edge); padding: 12px; overflow-y: auto; }
+  #stage { position: relative; }
+  canvas { width: 100%; height: 100%; display: block; }
+  h1 { font-size: 14px; margin: 0 0 4px; }
+  .sub { color: #8a8272; font-size: 11px; margin-bottom: 10px; }
+  fieldset { border: 1px solid var(--edge); border-radius: 6px; margin: 0 0 10px; padding: 8px; }
+  legend { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8a8272; }
+  button { font: inherit; padding: 4px 8px; margin: 2px 2px 2px 0; border: 1px solid var(--edge);
+           background: #fff; border-radius: 5px; cursor: pointer; }
+  button:hover { background: #fdfbf5; }
+  button.on { background: #c05b3c; color: #fff; border-color: #a84d31; }
+  input[type=range] { width: 100%; }
+  select, input[type=text] { font: inherit; width: 100%; padding: 3px; border: 1px solid var(--edge); border-radius: 4px; }
+  #log { position: absolute; bottom: 8px; left: 8px; right: 8px; max-height: 34%; overflow-y: auto;
+         background: rgba(255,255,255,.86); border: 1px solid var(--edge); border-radius: 6px;
+         padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; }
+  #tip { position: absolute; pointer-events: none; background: rgba(30,26,20,.9); color: #fdfbf5;
+         padding: 5px 8px; border-radius: 5px; font-size: 11px; transform: translate(10px, 10px);
+         max-width: 220px; display: none; z-index: 5; }
+  .row { display: flex; gap: 4px; align-items: center; margin: 3px 0; }
+  .row label { flex: 0 0 auto; color: #8a8272; }
+  .status { font-size: 11px; color: #8a8272; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>scene.js dev harness</h1>
+    <div class="sub">Fairfield / Randlehow — architect's model</div>
+
+    <fieldset>
+      <legend>Data source</legend>
+      <button id="srcFixtures" class="on">fixtures</button>
+      <button id="srcReal">real assets-src</button>
+      <div class="status" id="srcLabel">fixtures/</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Issues</legend>
+      <button id="btnLoad">setIssues(data)</button>
+      <button id="btnClear">setIssues([])</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Timeline · setTimeRange</legend>
+      <div class="row"><label>to</label><input type="range" id="tRange" min="0" max="100" value="100"></div>
+      <div class="status" id="tLabel">show all</div>
+      <button id="btnAll">show all (null,null)</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>focus(id)</legend>
+      <div class="row"><select id="focusSel"></select></div>
+      <button id="btnFocus">focus</button>
+      <button id="btnFrame">reset framing</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>setHighlight(id)</legend>
+      <div class="row"><select id="hiSel"></select></div>
+      <button id="btnHi">highlight</button>
+      <button id="btnHiOff">clear</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>setPickMode</legend>
+      <button id="btnPick">pick mode: OFF</button>
+      <div class="status">click terrain/road → onPick logs local + wgs84</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>geo + ghost · §5 rev3</legend>
+      <button id="btnRoundtrip">wgs84 ⇄ local</button>
+      <button id="btnHeight">terrainHeightAt</button>
+      <button id="btnSnap">snapToRoad</button><br>
+      <button id="btnGhost">showGhostPin</button>
+      <button id="btnGhostOff">clear ghost</button><br>
+      <button id="btnLabels" class="on">labels: ON</button>
+      <div class="status">drag the amber ghost on the terrain → onGhostMoved logs</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>lifecycle</legend>
+      <button id="btnResize">resize()</button>
+      <button id="btnDispose">dispose()</button>
+      <button id="btnReinit">re-init</button>
+    </fieldset>
+  </div>
+
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="tip"></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script type="module">
+import { initScene } from './scene.js';
+
+const logEl = document.getElementById('log');
+const tip = document.getElementById('tip');
+let handle = null, issues = [], buildings = null;
+
+// dispose() calls forceContextLoss() to free the GPU context; a force-lost
+// canvas cannot acquire a fresh WebGL context (browser limitation), so every
+// (re)boot swaps in a fresh <canvas>. The Leptos island does the same on remount.
+function freshCanvas() {
+  const old = document.getElementById('c');
+  const c = document.createElement('canvas');
+  c.id = 'c';
+  old.replaceWith(c);
+  return c;
+}
+
+// data sources: fixtures (self-contained) and the real baked assets one dir up
+const SOURCES = {
+  fixtures: {
+    base: './fixtures/', terrain: 'fixture-terrain.bin',
+    buildings: 'fixture-buildings.json', road: 'fixture-road.json',
+    issues: 'fixture-issues.json',
+  },
+  real: {
+    base: '../assets-src/', terrain: 'terrain.bin',
+    buildings: 'buildings.json', road: 'road-mesh.json',
+    issues: null,   // no seed issues baked yet → synthesise from the road
+  },
+};
+let source = 'fixtures';
+
+function log(...a) {
+  const line = a.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' ');
+  logEl.textContent = `${new Date().toLocaleTimeString()}  ${line}\n` + logEl.textContent;
+  logEl.textContent = logEl.textContent.split('\n').slice(0, 60).join('\n');
+}
+
+// build a handful of SceneIssues sitting on real road vertices (for pin testing)
+function synthIssues(roadMesh) {
+  const p = roadMesh.positions, n = p.length / 3;
+  const cats = ['surface', 'drainage-vegetation', 'winter-access'];
+  const sevs = ['low', 'medium', 'high'];
+  const stats = ['reported', 'in-progress', 'monitoring', 'fixed', 'closed', 'acknowledged'];
+  const day = 864e5;
+  const t0 = Date.parse('2024-06-01');
+  const out = [];
+  const picks = [0.12, 0.3, 0.48, 0.62, 0.78, 0.9];
+  picks.forEach((f, i) => {
+    const vi = Math.floor(f * (n - 1));
+    const x = p[vi * 3], y = p[vi * 3 + 1], z = p[vi * 3 + 2];
+    const status = stats[i % stats.length];
+    const fixed = (status === 'fixed' || status === 'closed');
+    out.push({
+      id: `synth-${i}`, category: cats[i % 3], severity: sevs[i % 3], status,
+      title: `Synthetic ${cats[i % 3]} issue ${i + 1}`,
+      local: [x, y, z],
+      reportedAtMs: t0 + i * 90 * day,
+      fixedAtMs: fixed ? t0 + (i * 90 + 45) * day : null,
+    });
+  });
+  return out;
+}
+
+async function loadData() {
+  const s = SOURCES[source];
+  buildings = await fetch(s.base + s.buildings).then(r => r.json());
+  const roadMesh = await fetch(s.base + s.road).then(r => r.json());
+  issues = s.issues
+    ? await fetch(s.base + s.issues).then(r => r.json())
+    : synthIssues(roadMesh);
+  return { roadMesh, terrainUrl: s.base + s.terrain };
+}
+
+function fillSelectors() {
+  const fSel = document.getElementById('focusSel');
+  const hSel = document.getElementById('hiSel');
+  fSel.innerHTML = ''; hSel.innerHTML = '';
+  const opt = (sel, v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+  [...buildings.buildings, ...buildings.context].forEach(b => {
+    opt(fSel, b.id, `🏠 ${b.label || b.id}`); opt(hSel, b.id, `🏠 ${b.label || b.id}`);
+  });
+  issues.forEach(i => { opt(fSel, i.id, `📍 ${i.title}`); opt(hSel, i.id, `📍 ${i.title}`); });
+}
+
+async function boot() {
+  const { roadMesh, terrainUrl } = await loadData();
+  fillSelectors();
+  const canvas = freshCanvas();
+  handle = await initScene(canvas, { terrainUrl, buildings, roadMesh });
+  handle.onHover(p => {
+    if (!p) { tip.style.display = 'none'; return; }
+    tip.style.display = 'block';
+    tip.style.left = p.screenX + 'px'; tip.style.top = p.screenY + 'px';
+    tip.innerHTML = p.type === 'building'
+      ? `<b>${p.name || p.id}</b><br>open issues: ${p.meta.openCount}`
+      : `<b>${p.meta.title}</b><br>${p.meta.category} · ${p.meta.severity} · ${p.meta.status}<br>${p.meta.ageDays}d old`;
+  });
+  handle.onSelect(s => log('onSelect', s));
+  handle.onPick(p => log('onPick', p));
+  handle.onGhostMoved(g => log('onGhostMoved', { local: g.local.map(n=>+n.toFixed(2)), wgs84: g.wgs84.map(n=>+n.toFixed(6)) }));
+  window.__scene = handle;        // exposed for QE / automated drivers
+  window.__road = roadMesh;
+  log('scene ready — press setIssues(fixtures)');
+}
+
+// ---- data-source toggle ----
+async function switchSource(key) {
+  source = key;
+  document.getElementById('srcFixtures').classList.toggle('on', key === 'fixtures');
+  document.getElementById('srcReal').classList.toggle('on', key === 'real');
+  document.getElementById('srcLabel').textContent = SOURCES[key].base;
+  if (handle) handle.dispose();
+  try { await boot(); log('source →', key, `(${SOURCES[key].base})`); }
+  catch (e) { log('BOOT ERROR', e && (e.stack || e.message) || e); }
+}
+document.getElementById('srcFixtures').onclick = () => switchSource('fixtures');
+document.getElementById('srcReal').onclick = () => switchSource('real');
+
+// ---- wire buttons ----
+document.getElementById('btnLoad').onclick = () => { handle.setIssues(issues); log('setIssues', issues.length); };
+document.getElementById('btnClear').onclick = () => { handle.setIssues([]); log('setIssues []'); };
+
+// timeline: map slider 0..100 across issue report/fix range
+const reps = () => issues.flatMap(i => [i.reportedAtMs, i.fixedAtMs]).filter(x => x != null);
+const tRange = document.getElementById('tRange');
+const tLabel = document.getElementById('tLabel');
+tRange.oninput = () => {
+  const rs = reps(); if (!rs.length) return;
+  const lo = Math.min(...rs) - 30 * 864e5, hi = Math.max(...rs) + 30 * 864e5;
+  const to = lo + (hi - lo) * (tRange.value / 100);
+  handle.setTimeRange(null, to);
+  tLabel.textContent = 'to = ' + new Date(to).toISOString().slice(0, 10);
+};
+document.getElementById('btnAll').onclick = () => { handle.setTimeRange(null, null); tLabel.textContent = 'show all'; tRange.value = 100; };
+
+document.getElementById('btnFocus').onclick = () => { const id = document.getElementById('focusSel').value; handle.focus(id); log('focus', id); };
+document.getElementById('btnFrame').onclick = () => { handle.focus('__none__'); log('(focus no-op → keeps view); use re-init to reset framing'); };
+
+document.getElementById('btnHi').onclick = () => { const id = document.getElementById('hiSel').value; handle.setHighlight(id); log('setHighlight', id); };
+document.getElementById('btnHiOff').onclick = () => { handle.setHighlight(null); log('setHighlight null'); };
+
+let pick = false;
+document.getElementById('btnPick').onclick = (e) => {
+  pick = !pick; handle.setPickMode(pick);
+  e.target.textContent = 'pick mode: ' + (pick ? 'ON' : 'OFF');
+  e.target.classList.toggle('on', pick);
+};
+
+// ---- geo + ghost (§5 rev3) ----
+document.getElementById('btnRoundtrip').onclick = () => {
+  const w = handle.localToWgs84(0, 0);
+  const back = handle.wgs84ToLocal(w[0], w[1]);
+  log('roundtrip: local(0,0) → wgs84', w.map(n=>+n.toFixed(6)), '→ local', back.map(n=>+n.toFixed(3)));
+};
+document.getElementById('btnHeight').onclick = () => {
+  log('terrainHeightAt(0,0) =', handle.terrainHeightAt(0, 0), ' outside(1e6,1e6) =', handle.terrainHeightAt(1e6, 1e6));
+};
+document.getElementById('btnSnap').onclick = () => {
+  // snap a point offset from the first road vertex (guaranteed near the road)
+  const rm = window.__road; const vx = rm.positions[0], vz = rm.positions[2];
+  const px = vx + 8, pz = vz + 8;
+  log('snapToRoad(', px.toFixed(1), pz.toFixed(1), ', 50) =', handle.snapToRoad(px, pz, 50));
+  log('snapToRoad far (+9999, 5) =', handle.snapToRoad(px + 9999, pz, 5));
+};
+document.getElementById('btnGhost').onclick = () => {
+  const rm = window.__road; const vx = rm.positions[0], vz = rm.positions[2];
+  handle.showGhostPin([vx, 0, vz]); log('showGhostPin at road start — drag it');
+};
+document.getElementById('btnGhostOff').onclick = () => { handle.showGhostPin(null); log('ghost cleared'); };
+let labelsOn = true;
+document.getElementById('btnLabels').onclick = (e) => {
+  labelsOn = !labelsOn; handle.setLabels(labelsOn);
+  e.target.textContent = 'labels: ' + (labelsOn ? 'ON' : 'OFF');
+  e.target.classList.toggle('on', labelsOn);
+  log('setLabels', labelsOn);
+};
+
+document.getElementById('btnResize').onclick = () => { handle.resize(); log('resize()'); };
+document.getElementById('btnDispose').onclick = () => { handle.dispose(); handle = null; log('disposed — canvas released'); };
+document.getElementById('btnReinit').onclick = async () => { if (handle) handle.dispose(); await boot(); };
+
+window.addEventListener('resize', () => handle && handle.resize());
+boot().catch(e => log('BOOT ERROR', e.message || e));
+</script>
+</body>
+</html>

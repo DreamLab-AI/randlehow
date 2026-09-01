@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Randlehow — the road's shared record</title>
+  <meta name="description" content="A private, shared 3D record of Randlehow road: its condition, repairs and projects." />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a2b1e'/%3E%3Cpath d='M8 24 L16 8 L24 24' stroke='%23faf8f3' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <!-- Static splash: no JS dependencies, shown until the app mounts. -->
+  <div id="splash" class="splash">
+    <div class="splash-card">
+      <div class="splash-mark">Randlehow</div>
+      <div class="splash-sub">the road's shared record</div>
+      <div class="splash-spinner" aria-hidden="true"></div>
+      <noscript>
+        <p class="splash-noscript">
+          This record needs JavaScript and WebAssembly to open. Please enable them in your browser.
+        </p>
+      </noscript>
+    </div>
+  </div>
+
+  <!-- Module loader: instantiate the WASM app; the app imports scene.js (ADR-006). -->
+  <script type="module">
+    import init from './pkg/randlehow.js';
+    init()
+      .then(() => {
+        const s = document.getElementById('splash');
+        if (s) s.remove();
+      })
+      .catch((err) => {
+        console.error('Failed to start Randlehow', err);
+        const s = document.getElementById('splash');
+        if (s) {
+          s.innerHTML =
+            '<div class="splash-card"><div class="splash-mark">Randlehow</div>' +
+            '<p class="splash-noscript">Something went wrong loading the road record. ' +
+            'Please refresh, or try a different browser.</p></div>';
+        }
+      });
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+three.js r185 (npm 0.185.1) — vendored from jsdelivr 2026-09-01
+
+Files (ES modules, no npm / no node_modules):
+  three.module.js   build/three.module.js   (re-exports from ./three.core.js)
+  three.core.js     build/three.core.js     (the actual engine; no external imports)
+  OrbitControls.js  examples/jsm/controls/OrbitControls.js
+                    — import path patched: 'three' → './three.module.js'
+
+Source: https://cdn.jsdelivr.net/npm/three@0.185.1/
+Load graph: scene.js → three.module.js → three.core.js
+            scene.js → OrbitControls.js → three.module.js
