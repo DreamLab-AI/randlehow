@@ -239,9 +239,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setClearColor(0x000000, 0); // transparent → CSS paper gradient shows through
   renderer.shadowMap.enabled = true;
-  // r185 deprecated PCFSoftShadowMap (falls back to hard PCF); VSM is the
-  // current path to genuinely soft, long shadows — the architect's-model look.
-  renderer.shadowMap.type = THREE.VSMShadowMap;
+  // Standard PCF shadows (auto-updating). VSM was dropped: its light-bleed
+  // banding on building walls read as false "wedge"/slant artefacts, and the
+  // frozen-VSM optimisation was clever-but-fragile. At ~150k tris a plain
+  // continuous renderer with basic shadows is correct and boring.
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
 
@@ -302,8 +304,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     m.vertexColors = false;         // albedo is the colour authority now
     m.color.set(0xffffff);
     m.needsUpdate = true;
-    requestShadowUpdate();
-    requestRender();
+    // continuous renderer picks this up on the next frame — no invalidation needed
   }, undefined, () => { /* no albedo → keep vertex height-tint */ });
 
   // ---- background fog softens the far boundary into paper --------------
@@ -330,21 +331,12 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   sc.near = 1; sc.far = modelSpan * 2.2;
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.6;
-  sun.shadow.radius = 5;        // VSM blur → soft penumbra
-  sun.shadow.blurSamples = 16;
   scene.add(sun);
   scene.add(sun.target);
 
   const fill = new THREE.DirectionalLight(0xffffff, 0.34); // SE fill keeps shadows readable
   fill.position.set(xC + modelSpan * 0.4, yC + modelSpan * 0.3, zC + modelSpan * 0.4);
   scene.add(fill);
-
-  // PERF: freeze the VSM shadow map — it's view-independent, so recomputing it
-  // every frame (which the pin pulse used to force) is pure waste on phones.
-  // Compute once, then only on structural change (setIssues/timeline/ghost).
-  sun.shadow.autoUpdate = false;
-  sun.shadow.needsUpdate = true;              // first render computes it
-  function requestShadowUpdate() { sun.shadow.needsUpdate = true; }
 
   // ---- buildings -------------------------------------------------------
   const buildingMeshes = [];            // pickable
@@ -459,10 +451,6 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   let pendingHover = null;      // latest pointer event awaiting raycast
   let downPos = null;           // pointerdown position (click vs drag)
   let draggingGhost = false;    // ghost-pin drag in progress
-  // pulse gating (perf): only drive continuous render when a pulsing pin is
-  // actually on-screen and the tab is visible
-  const _frustum = new THREE.Frustum();
-  const _frMat = new THREE.Matrix4();
   let pageVisible = (typeof document === 'undefined') || document.visibilityState !== 'hidden';
 
   // ---- ghost pin (provisional "report here" marker, drag-on-terrain) ---
@@ -675,35 +663,18 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // ════════════════════════════════════════════════════════════════════
   // per-frame update of pins (fade / scale / pulse)
   // ════════════════════════════════════════════════════════════════════
-  const PIN_WORLD_H = 0.6 + PIN_CONE_H + 1.0;   // nominal unscaled pin height (m)
-  // returns { fading (transient, full-rate), pulseVisible (30fps ticker) }
+  // per-frame pin update: fade/scale settle + gentle pulse on high+open pins.
+  // Continuous renderer → no gating needed; pins keep their enlarged base cone.
   function updatePins(dt, time) {
-    let fading = false, pulseVisible = false;
     const k = 1 - Math.pow(0.001, dt / 0.2); // ~200ms settle
-    // screen-space floor: a pin never draws under ~16px tall (P0 unmissable)
-    const vh = (canvas.clientHeight || canvas.height || 1);
-    const perPxPerM = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / vh;
-    const MIN_PX = 16;
-    // build frustum once per frame for pulse on-screen tests
-    const anyPulse = pageVisible; // cheap gate: skip frustum work if tab hidden
-    if (anyPulse) _frustum.setFromProjectionMatrix(_frMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
     pinRecords.forEach(rec => {
-      const before = rec.curOpa, beforeS = rec.curScale;
       rec.curOpa = lerp(rec.curOpa, rec.tgtOpa, k);
       rec.curScale = lerp(rec.curScale, rec.tgtScale, k);
       if (Math.abs(rec.curOpa - rec.tgtOpa) < 0.005) rec.curOpa = rec.tgtOpa;
       if (Math.abs(rec.curScale - rec.tgtScale) < 0.005) rec.curScale = rec.tgtScale;
 
       let s = rec.baseScale * rec.curScale;
-      if (rec.pulse && rec.curOpa > 0.5 && anyPulse && _frustum.containsPoint(rec.group.position)) {
-        s *= 1 + 0.05 * Math.sin(time * 3.2); pulseVisible = true;
-      }
-      // enforce screen-space minimum (only while opening/opened, not mid fade-out)
-      if (rec.tgtScale > 0.5) {
-        const d = camera.position.distanceTo(rec.group.position);
-        const minScale = (MIN_PX * perPxPerM * d) / PIN_WORLD_H;
-        if (s < minScale) s = minScale;
-      }
+      if (rec.pulse && rec.curOpa > 0.5) s *= 1 + 0.05 * Math.sin(time * 3.2);
       rec.group.scale.setScalar(Math.max(s, 0.0001));
 
       const isHi = (rec.issue.id === highlightId) || (rec.issue.id === hoverId);
@@ -712,10 +683,8 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
         m.emissiveIntensity = (rec.form === 'sunken' ? 0.03 : 0.18) + (isHi ? 0.5 : 0);
       });
 
-      if (rec.curOpa !== before || rec.curScale !== beforeS) fading = true;
       if (rec.curOpa <= 0.001 && rec.tgtOpa === 0) rec.group.visible = false;
     });
-    return { fading, pulseVisible };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -840,26 +809,21 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // render loop (on-demand)
+  // render loop — plain continuous rAF while the page is visible.
+  // (What every map/3D site does. No invalidation machinery = no stale-frame
+  // bugs: async loads, texture swaps, setIssues all just appear next frame.)
   // ════════════════════════════════════════════════════════════════════
-  let rafId = 0, pulseTimer = 0, running = true, needsRender = true, lastT = now(), contextLost = false;
-
-  function requestRender() {
-    needsRender = true;
-    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }   // upgrade pulse-rate → now
-    if (!rafId && running && !contextLost) rafId = requestAnimationFrame(frame);
-  }
+  let rafId = 0, running = true, lastT = now(), contextLost = false;
 
   function frame() {
     rafId = 0;
-    if (!running || contextLost) return;
+    if (!running || contextLost || !pageVisible) return;
     const t = now();
     const dt = Math.min((t - lastT) / 1000, 0.1);
     lastT = t;
 
     processHover();
 
-    // camera tween
     if (tween) {
       const p = clamp((t - tween.t0) / tween.dur, 0, 1);
       const e = easeInOutCubic(p);
@@ -868,32 +832,25 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
       if (p >= 1) tween = null;
     }
 
-    const controlsChanged = controls.update();
-    const { fading, pulseVisible } = updatePins(dt, t / 1000);
-    const ghostActive = updateGhost(t / 1000);
-    updateLabels();   // distance-based scale + fade (no continuous render needed)
+    controls.update();
+    updatePins(dt, t / 1000);
+    updateGhost(t / 1000);
+    updateLabels();
 
-    renderer.render(scene, camera);   // shadow map skipped unless needsUpdate set
-
-    // full-rate loop only while genuinely settling; else a 30fps pulse ticker
-    // (shadow-frozen) if a pin is pulsing on-screen; else stop entirely.
-    if (tween || controlsChanged || fading || ghostActive) {
-      rafId = requestAnimationFrame(frame);
-    } else if (pulseVisible) {
-      pulseTimer = setTimeout(() => { pulseTimer = 0; if (running && !contextLost) rafId = requestAnimationFrame(frame); }, 33);
-    } else {
-      needsRender = false; // idle — no more frames until requestRender()
-    }
+    renderer.render(scene, camera);
+    rafId = requestAnimationFrame(frame);   // always continue while visible
   }
-  // kick continuous frames while OrbitControls damping settles
-  controls.addEventListener('change', requestRender);
-  controls.addEventListener('start', requestRender);
+  // requestRender = "ensure the loop is running" (idempotent). Kept as a name so
+  // existing call sites still work; the loop runs continuously while visible.
+  function requestRender() {
+    if (!rafId && running && !contextLost && pageVisible) rafId = requestAnimationFrame(frame);
+  }
 
   canvas.addEventListener('pointermove', onPointerMove, { passive: true });
   canvas.addEventListener('pointerdown', onPointerDown, { passive: true });
   canvas.addEventListener('pointerup', onPointerUp, { passive: true });
 
-  // ---- page visibility (pause pulse when tab hidden) -------------------
+  // ---- page visibility (pause the loop when the tab is hidden) ---------
   function onVisibility() {
     pageVisible = document.visibilityState !== 'hidden';
     if (pageVisible) { lastT = now(); requestRender(); }
@@ -911,19 +868,10 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   function doResize() {
     const w = canvas.clientWidth || canvas.width || 1;
     const h = canvas.clientHeight || canvas.height || 1;
-    const mobile = w < 800;                          // PERF: mobile budget
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, mobile ? 1.5 : 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(w, h, false);
-    // shadow map 1024 on small viewports, 2048 on desktop
-    const wantShadow = mobile ? 1024 : 2048;
-    if (sun.shadow.mapSize.x !== wantShadow) {
-      sun.shadow.mapSize.set(wantShadow, wantShadow);
-      if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
-      sun.shadow.needsUpdate = true;
-    }
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
-    requestRender();
   }
   doResize();
   requestRender();
@@ -953,14 +901,14 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
         const pid = m.userData.propertyId;
         if (pid != null && openByProp.has(pid)) m.userData.openCount = openByProp.get(pid);
       });
-      requestShadowUpdate(); requestRender();   // pins changed → refresh frozen shadows
+      requestRender();   // pins changed → refresh frozen shadows
     },
 
     setTimeRange(fromMs, toMs) {
       timeFrom = (fromMs == null ? null : fromMs);
       timeTo = (toMs == null ? null : toMs);
       pinRecords.forEach(applyTimelineTo);
-      requestShadowUpdate(); requestRender();
+      requestRender();
     },
 
     focus(entityId) {
@@ -1029,11 +977,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     },
 
     showGhostPin(local) {
-      if (local == null) { if (ghost) ghost.group.visible = false; requestShadowUpdate(); requestRender(); return; }
+      if (local == null) { if (ghost) ghost.group.visible = false; requestRender(); return; }
       const g = ensureGhost();
       positionGhost(local[0], local[2]);
       g.group.visible = true;
-      requestShadowUpdate(); requestRender();
+      requestRender();
     },
     onGhostMoved(cb) { cbs.ghostMoved = typeof cb === 'function' ? cb : null; },
 
@@ -1044,7 +992,6 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     dispose() {
       running = false;
       if (rafId) cancelAnimationFrame(rafId);
-      if (pulseTimer) clearTimeout(pulseTimer);
       clearTimeout(resizeTimer);
       controls.removeEventListener('change', requestRender);
       controls.removeEventListener('start', requestRender);
