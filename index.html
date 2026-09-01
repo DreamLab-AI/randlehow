@@ -25,6 +25,29 @@
     </div>
   </div>
 
+  <!-- First-run bootstrap (MUST be the first script, contracts §7 / Codex
+       finding 8): capture and strip the #k= unlock fragment BEFORE any other
+       code loads, so the password never lingers in the address bar / history
+       while the WASM downloads. Hands the password to the app via sessionStorage. -->
+  <script>
+    (function () {
+      try {
+        var h = location.hash || '';
+        if (h.indexOf('#k=') === 0) {
+          var pw = h.slice(3);
+          try { pw = decodeURIComponent(pw); } catch (e) { /* keep raw */ }
+          try { sessionStorage.setItem('rlhw-k', pw); } catch (e) {}
+          history.replaceState(null, '', location.pathname + location.search);
+          if (location.hash) {
+            console.warn('Randlehow: could not clear the unlock fragment from the URL');
+          }
+        }
+      } catch (e) {
+        console.error('Randlehow: fragment bootstrap failed', e);
+      }
+    })();
+  </script>
+
   <!-- Module loader: instantiate the WASM app; the app imports scene.js (ADR-006). -->
   <script type="module">
     import init from './pkg/randlehow.js';
