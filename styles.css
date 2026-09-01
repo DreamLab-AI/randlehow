@@ -86,16 +86,17 @@ a { color: var(--sage-deep); }
 .remember-title { color: var(--ink); font-weight: 600; }
 .remember-warn { font-size: 12px; color: var(--warn); line-height: 1.35; }
 .btn-primary {
-  background: var(--ink); color: var(--paper); border: none; border-radius: var(--radius-sm);
+  background: var(--sage-deep); color: var(--paper); border: none; border-radius: var(--radius-sm);
   padding: 12px 16px; font-size: 15px; font-weight: 600; cursor: pointer; min-height: 44px;
 }
-.btn-primary:hover { background: var(--sage-deep); }
+.btn-primary:hover { background: var(--ink); }
 .btn-primary:disabled { opacity: 0.6; cursor: default; }
 .unlock-error { color: var(--danger); font-size: 14px; margin: 2px 0 0; }
 .unlock-foot { color: var(--ink-soft); font-size: 12px; margin: 20px 0 0; }
 .not-published { text-align: left; background: var(--panel); border-radius: var(--radius-sm); padding: 16px; }
 .np-title { font-weight: 700; margin: 0 0 6px; }
 .np-body { color: var(--ink-soft); font-size: 14px; margin: 0; }
+.stale-card .btn-primary { margin-top: 14px; width: 100%; }
 
 /* ── App shell — MOBILE FIRST (390×844 portrait): scene fills the viewport,
    panels are bottom sheets/overlays, editor actions dock in thumb reach. ──── */
@@ -114,6 +115,17 @@ a { color: var(--sage-deep); }
 }
 .scene-note p { margin: 2px 0; }
 .scene-note-sub { font-size: 13px; }
+
+/* First-run hint over the scene (dismissible, remembered). */
+.scene-hint {
+  position: absolute; z-index: 22; left: 8px; right: 8px;
+  top: calc(env(safe-area-inset-top) + 110px);
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  background: rgba(26, 43, 30, 0.92); color: var(--paper);
+  padding: 8px 10px 8px 14px; border-radius: 999px; font-size: 13px;
+  box-shadow: var(--shadow); max-width: 460px; margin: 0 auto;
+}
+.hint-x { background: transparent; border: none; color: var(--paper); font-size: 20px; line-height: 1; cursor: pointer; min-width: 32px; min-height: 32px; }
 
 /* Header: translucent bar over the scene, respecting the notch. */
 .app-header {
@@ -147,7 +159,6 @@ a { color: var(--sage-deep); }
   overflow: hidden;
 }
 .side.expanded { height: min(78dvh, 640px); }
-.app.editing .side { bottom: calc(64px + env(safe-area-inset-bottom)); }
 .sheet-grip { display: flex; justify-content: center; align-items: center; min-height: 44px; height: 44px; border: none; background: transparent; cursor: pointer; width: 100%; }
 .grip-bar { width: 42px; height: 5px; border-radius: 3px; background: var(--hairline); }
 
@@ -188,13 +199,13 @@ a { color: var(--sage-deep); }
 .ir-meta { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .ir-date { color: var(--ink-soft); font-size: 12px; }
 
-.chip { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+.chip { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
 .chip-prop { background: var(--panel); color: var(--sage-deep); border-color: var(--hairline); }
 .chip-status { background: var(--panel); color: var(--sage-deep); border-color: var(--hairline); }
 .chip-kind { background: var(--ink); color: var(--paper); }
-.sev-low { background: #eaf1e6; color: #3f6a3a; }
-.sev-med { background: #f6ecd6; color: #7d5511; }
-.sev-high { background: #f6dcd6; color: #8a2f22; }
+.sev-low { background: #d7e6cd; color: #315a2c; }
+.sev-med { background: #efdcb2; color: #6d4a0f; }
+.sev-high { background: #efc7bc; color: #7a271b; }
 .st-open { background: #fff; color: var(--sage-deep); border-color: var(--hairline); }
 .st-resolved { background: #e7efe4; color: #3f6a3a; }
 
@@ -253,7 +264,7 @@ a { color: var(--sage-deep); }
 .ph-main { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .ph-name { font-family: var(--serif); font-size: 17px; font-weight: 600; }
 .progress { display: flex; flex-direction: column; gap: 4px; }
-.progress-track { height: 9px; background: var(--panel); border-radius: 999px; overflow: hidden; }
+.progress-track { height: 9px; background: var(--panel); border: 1px solid var(--hairline); border-radius: 999px; overflow: hidden; }
 .progress-fill { height: 100%; background: linear-gradient(90deg, var(--sage), var(--sage-deep)); border-radius: 999px; }
 .progress-label { font-size: 12px; color: var(--ink-soft); }
 .project-body { padding: 0 14px 16px; border-top: 1px solid var(--panel); }
@@ -267,9 +278,14 @@ a { color: var(--sage-deep); }
 .materials tfoot td { font-weight: 700; border-top: 1px solid var(--hairline); border-bottom: none; }
 
 .channels { list-style: none; margin: 4px 0 0; padding: 0; }
-.channels li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--panel); }
-.ch-kind { font-weight: 600; color: var(--sage-deep); }
-.ch-val { color: var(--ink); text-align: right; }
+.channels li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; padding: 9px 0; border-bottom: 1px solid var(--panel); }
+.ch-kind { font-weight: 600; color: var(--sage-deep); flex: none; }
+.ch-val { color: var(--ink); text-align: right; word-break: break-word; overflow-wrap: anywhere; min-width: 0; }
+/* Never clip payment details on narrow phones — stack value under its label. */
+@media (max-width: 420px) {
+  .channels li { flex-direction: column; align-items: flex-start; }
+  .ch-val { text-align: left; }
+}
 .linked-issues { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ── Road matters ────────────────────────────────────────────────────────── */
@@ -295,11 +311,10 @@ code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size
 /* actions dock: fixed to the bottom, horizontally scrollable, above safe area */
 .edit-actions {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 46;
-  display: flex; align-items: center; gap: 8px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   padding: 8px max(10px, env(safe-area-inset-left))
            calc(8px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-right));
   background: var(--panel); border-top: 1px solid var(--hairline);
-  overflow-x: auto; -webkit-overflow-scrolling: touch;
 }
 .btn-small {
   background: var(--sage); color: var(--paper); border: none; border-radius: var(--radius-sm);
@@ -309,12 +324,14 @@ code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size
 .btn-small:hover { background: var(--sage-deep); }
 .btn-small:disabled { opacity: 0.5; cursor: default; }
 .draft-count { color: var(--ink-soft); font-size: 12px; white-space: nowrap; }
+/* Helper on its own full-width line at the top of the dock. */
 .edit-reminder {
-  position: fixed; left: 8px; right: 8px; z-index: 45;
-  bottom: calc(60px + env(safe-area-inset-bottom));
-  margin: 0; padding: 4px 8px; text-align: center; border-radius: 6px;
-  background: rgba(26,43,30,0.85); color: #e7d9b6; font-size: 12px; font-style: italic;
+  flex-basis: 100%; margin: 0; padding: 0; text-align: center;
+  color: var(--warn); font-size: 12px; font-style: italic;
 }
+/* While editing on a phone, the scene + dock take over; the list sheet hides
+   (the GPS + report buttons already need two rows at 390px). */
+.app.editing .side { display: none; }
 
 /* ── GPS "Report here" (F5.2a) ───────────────────────────────────────────── */
 .gps { display: inline-flex; }
@@ -404,7 +421,7 @@ code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size
     padding-bottom: 0;
   }
   .side.expanded { height: auto; }
-  .app.editing .side { bottom: auto; }
+  .app.editing .side { display: flex; bottom: auto; } /* keep the column on desktop */
   .sheet-grip { display: none; }
 
   /* editor flows inline in the header (not a bottom dock) */

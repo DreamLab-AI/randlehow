@@ -277,22 +277,50 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const modelSpan = Math.max(spanX, spanZ);
   const center = new THREE.Vector3(xC, yC, zC);
 
-  const terrainMesh = buildTerrain(terrain, geometries, materials, roadMesh);
+  // §2.1b: prefer the pre-decimated continuous mesh; parse it before building
+  const meshData = await fetchTerrainMesh(terrainUrl.replace(/[^/]+$/, 'terrain-mesh.bin'));
+  const terrainMesh = buildTerrain(terrain, geometries, materials, roadMesh, meshData);
   scene.add(terrainMesh.mesh);
   scene.add(terrainMesh.skirt);
-  if (terrainMesh.lodSkirt) scene.add(terrainMesh.lodSkirt);
   const sampleHeight = terrainMesh.sampleHeight;
 
-  // ---- background fog blends model edge into paper ---------------------
-  scene.fog = new THREE.Fog(PAL.fog, modelSpan * 0.55, modelSpan * 1.7);
+  // terrain-albedo.png (contracts §2.1a): baked cream + road paint, solves
+  // subpixel ribbon aliasing at overview. Sibling of terrain.bin. Applied as
+  // the map; vertex height-tint dropped so the albedo is the colour authority.
+  // Ribbon meshes stay for close range / picking / snapping.
+  const albedoUrl = terrainUrl.replace(/[^/]+$/, 'terrain-albedo.png');
+  new THREE.TextureLoader().load(albedoUrl, (tex) => {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = true;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    tex.needsUpdate = true;
+    const m = terrainMesh.mesh.material;
+    m.map = tex;
+    m.vertexColors = false;         // albedo is the colour authority now
+    m.color.set(0xffffff);
+    m.needsUpdate = true;
+    requestShadowUpdate();
+    requestRender();
+  }, undefined, () => { /* no albedo → keep vertex height-tint */ });
+
+  // ---- background fog softens the far boundary into paper --------------
+  // The boundary-hugging plinth already makes any visible edge read as an
+  // intentional model edge (not a cut); fog just adds atmospheric depth so the
+  // far edge/plinth base melts into the paper gradient. Kept gentle so core
+  // features (road/houses) stay clear.
+  scene.fog = new THREE.Fog(PAL.fog, modelSpan * 0.60, modelSpan * 1.45);
 
   // ---- lighting --------------------------------------------------------
-  const hemi = new THREE.HemisphereLight(PAL.hemiSky, PAL.hemiGround, 0.75);
+  // hemi lowered (0.75→0.5) for more directional depth without crushing blacks
+  const hemi = new THREE.HemisphereLight(PAL.hemiSky, PAL.hemiGround, 0.5);
   scene.add(hemi);
 
   const sun = new THREE.DirectionalLight(PAL.sun, 2.6);
-  // NW, low: −x (west), +z? NW = west+north → −x, −z. low elevation.
-  sun.position.set(xC - modelSpan * 0.5, yC + modelSpan * 0.45, zC - modelSpan * 0.55);
+  // NW, low: −x (west), −z (north), lower elevation → longer soft shadows
+  sun.position.set(xC - modelSpan * 0.55, yC + modelSpan * 0.30, zC - modelSpan * 0.6);
   sun.target.position.copy(center);
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
@@ -307,9 +335,16 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   scene.add(sun);
   scene.add(sun.target);
 
-  const fill = new THREE.DirectionalLight(0xffffff, 0.25); // gentle SE fill, no shadow
+  const fill = new THREE.DirectionalLight(0xffffff, 0.34); // SE fill keeps shadows readable
   fill.position.set(xC + modelSpan * 0.4, yC + modelSpan * 0.3, zC + modelSpan * 0.4);
   scene.add(fill);
+
+  // PERF: freeze the VSM shadow map — it's view-independent, so recomputing it
+  // every frame (which the pin pulse used to force) is pure waste on phones.
+  // Compute once, then only on structural change (setIssues/timeline/ghost).
+  sun.shadow.autoUpdate = false;
+  sun.shadow.needsUpdate = true;              // first render computes it
+  function requestShadowUpdate() { sun.shadow.needsUpdate = true; }
 
   // ---- buildings -------------------------------------------------------
   const buildingMeshes = [];            // pickable
@@ -321,6 +356,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const labelsGroup = new THREE.Group();
   scene.add(labelsGroup);
   const labelSprites = [];              // {sprite, pos:Vector3, aspect}
+  const _labelProj = new THREE.Vector3();
   let labelsVisible = true;
   const LABEL_FADE_NEAR = 120, LABEL_FADE_FAR = 180; // camera dist metres (close-range only)
   buildLabels(labelAnchors);
@@ -364,10 +400,15 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     const vh = (canvas.clientHeight || canvas.height || 1);
     const perPxPerM = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / vh;
     const TARGET_PX = 34;               // card height on screen (phone-legible)
+    const TOP_SAFE_PX = 90;             // keep labels clear of the timeline UI
     for (const L of labelSprites) {
       const d = camera.position.distanceTo(L.pos);
       const op = clamp((LABEL_FADE_FAR - d) / (LABEL_FADE_FAR - LABEL_FADE_NEAR), 0, 1);
       if (op <= 0.001) { L.sprite.visible = false; continue; }
+      // P1: hide any label projecting into the top safe area (timeline overlay)
+      _labelProj.copy(L.pos).project(camera);
+      const screenY = (1 - (_labelProj.y * 0.5 + 0.5)) * vh;
+      if (_labelProj.z > 1 || screenY < TOP_SAFE_PX) { L.sprite.visible = false; continue; }
       L.sprite.visible = true;
       L.sprite.material.opacity = op;
       // constant on-screen size; band chosen so no clamping across the
@@ -395,12 +436,14 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const pinRecords = new Map();  // id → record
   const pinHitTargets = [];      // hit spheres (pickable)
   // shared pin geometries
+  // P0: pins enlarged (cone 0.9/3.0 → 1.4/4.5) so they read unmissably
+  const PIN_CONE_H = 4.5;
   const pinGeo = {
-    cone:   trackGeo(new THREE.ConeGeometry(0.9, 3.0, 18)),
-    top:    trackGeo(new THREE.SphereGeometry(0.55, 16, 12)),
-    ring:   trackGeo(new THREE.TorusGeometry(1.45, 0.16, 10, 28)),
-    disc:   trackGeo(new THREE.CylinderGeometry(1.35, 1.35, 0.28, 24)),
-    hit:    trackGeo(new THREE.SphereGeometry(2.8, 8, 6)),
+    cone:   trackGeo(new THREE.ConeGeometry(1.4, PIN_CONE_H, 18)),
+    top:    trackGeo(new THREE.SphereGeometry(0.72, 16, 12)),
+    ring:   trackGeo(new THREE.TorusGeometry(2.05, 0.22, 10, 28)),
+    disc:   trackGeo(new THREE.CylinderGeometry(1.9, 1.9, 0.30, 24)),
+    hit:    trackGeo(new THREE.SphereGeometry(3.6, 8, 6)),
   };
 
   // ---- state -----------------------------------------------------------
@@ -416,6 +459,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   let pendingHover = null;      // latest pointer event awaiting raycast
   let downPos = null;           // pointerdown position (click vs drag)
   let draggingGhost = false;    // ghost-pin drag in progress
+  // pulse gating (perf): only drive continuous render when a pulsing pin is
+  // actually on-screen and the tab is visible
+  const _frustum = new THREE.Frustum();
+  const _frMat = new THREE.Matrix4();
+  let pageVisible = (typeof document === 'undefined') || document.visibilityState !== 'hidden';
 
   // ---- ghost pin (provisional "report here" marker, drag-on-terrain) ---
   let ghost = null;             // {group, hit, materials[]}
@@ -428,7 +476,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     const ringMat = new THREE.MeshBasicMaterial({ color: amber, transparent: true, opacity: 0.5, depthWrite: false });
     mats.push(stemMat, ringMat);
     materials.add(stemMat); materials.add(ringMat);
-    const coneH = 4.0, floatGap = 0.8;
+    const coneH = PIN_CONE_H, floatGap = 0.8;
     const cone = new THREE.Mesh(pinGeo.cone, stemMat);
     cone.rotation.x = Math.PI; cone.position.y = floatGap + coneH / 2; cone.scale.setScalar(1.15);
     cone.raycast = () => {};
@@ -461,14 +509,28 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // camera framing + tween
   // ════════════════════════════════════════════════════════════════════
   function frameWhole() {
-    // whole road from SE, sun-lit
-    const dist = modelSpan * 0.95;
-    camera.position.set(xC + dist * 0.6, yC + dist * 0.55, zC + dist * 0.62);
-    controls.target.copy(center);
-    controls.minDistance = modelSpan * 0.12;
-    controls.maxDistance = modelSpan * 2.0;
+    // Frame the ROAD CORRIDOR tightly (the pin cluster spans it), from SE, sun-lit.
+    let fx = xC, fz = zC, fy = yC, fspan = modelSpan;
+    if (roadVerts && roadVerts.length) {
+      let mnx = Infinity, mxx = -Infinity, mnz = Infinity, mxz = -Infinity;
+      for (let i = 0; i < roadVerts.length; i += 3) {
+        const x = roadVerts[i], z = roadVerts[i + 2];
+        if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+        if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+      }
+      fx = (mnx + mxx) / 2; fz = (mnz + mxz) / 2;
+      fspan = Math.max(mxx - mnx, mxz - mnz) * 1.2;   // pad a touch
+      const sh = sampleHeight(fx, fz); fy = Number.isFinite(sh) ? sh + 6 : yC;
+    }
+    const dist = fspan * 0.9;
+    camera.position.set(fx + dist * 0.6, fy + dist * 0.55, fz + dist * 0.62);
+    controls.target.set(fx, fy, fz);
+    controls.minDistance = modelSpan * 0.10;
+    // clamp pull-back INSIDE the fog envelope so you can never orbit far enough
+    // to see the island floating in the void / the boundary as a hard cut
+    controls.maxDistance = modelSpan * 0.95;
     controls.minPolarAngle = 0.12;
-    controls.maxPolarAngle = 1.45; // stay above ground plane
+    controls.maxPolarAngle = 1.40; // never fully top-down (edges would show)
     controls.update();
   }
   frameWhole();
@@ -525,7 +587,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
       disc.receiveShadow = true;
       rec.group.add(disc); rec.meshes.push(disc);
     } else {
-      const coneH = 3.0;
+      const coneH = PIN_CONE_H;
       const cone = new THREE.Mesh(pinGeo.cone, mat);
       cone.rotation.x = Math.PI;                     // apex down
       cone.position.y = floatGap + coneH / 2;
@@ -613,9 +675,18 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // ════════════════════════════════════════════════════════════════════
   // per-frame update of pins (fade / scale / pulse)
   // ════════════════════════════════════════════════════════════════════
+  const PIN_WORLD_H = 0.6 + PIN_CONE_H + 1.0;   // nominal unscaled pin height (m)
+  // returns { fading (transient, full-rate), pulseVisible (30fps ticker) }
   function updatePins(dt, time) {
-    let active = false;
+    let fading = false, pulseVisible = false;
     const k = 1 - Math.pow(0.001, dt / 0.2); // ~200ms settle
+    // screen-space floor: a pin never draws under ~16px tall (P0 unmissable)
+    const vh = (canvas.clientHeight || canvas.height || 1);
+    const perPxPerM = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / vh;
+    const MIN_PX = 16;
+    // build frustum once per frame for pulse on-screen tests
+    const anyPulse = pageVisible; // cheap gate: skip frustum work if tab hidden
+    if (anyPulse) _frustum.setFromProjectionMatrix(_frMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
     pinRecords.forEach(rec => {
       const before = rec.curOpa, beforeS = rec.curScale;
       rec.curOpa = lerp(rec.curOpa, rec.tgtOpa, k);
@@ -624,20 +695,27 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
       if (Math.abs(rec.curScale - rec.tgtScale) < 0.005) rec.curScale = rec.tgtScale;
 
       let s = rec.baseScale * rec.curScale;
-      if (rec.pulse && rec.curOpa > 0.5) { s *= 1 + 0.05 * Math.sin(time * 3.2); active = true; }
+      if (rec.pulse && rec.curOpa > 0.5 && anyPulse && _frustum.containsPoint(rec.group.position)) {
+        s *= 1 + 0.05 * Math.sin(time * 3.2); pulseVisible = true;
+      }
+      // enforce screen-space minimum (only while opening/opened, not mid fade-out)
+      if (rec.tgtScale > 0.5) {
+        const d = camera.position.distanceTo(rec.group.position);
+        const minScale = (MIN_PX * perPxPerM * d) / PIN_WORLD_H;
+        if (s < minScale) s = minScale;
+      }
       rec.group.scale.setScalar(Math.max(s, 0.0001));
 
-      const baseOpa = rec.form === 'sunken' ? 0.4 : 1.0;
       const isHi = (rec.issue.id === highlightId) || (rec.issue.id === hoverId);
       rec.ownMaterials.forEach(m => {
         m.opacity = rec.curOpa;
         m.emissiveIntensity = (rec.form === 'sunken' ? 0.03 : 0.18) + (isHi ? 0.5 : 0);
       });
 
-      if (rec.curOpa !== before || rec.curScale !== beforeS) active = true;
+      if (rec.curOpa !== before || rec.curScale !== beforeS) fading = true;
       if (rec.curOpa <= 0.001 && rec.tgtOpa === 0) rec.group.visible = false;
     });
-    return active;
+    return { fading, pulseVisible };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -764,10 +842,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // ════════════════════════════════════════════════════════════════════
   // render loop (on-demand)
   // ════════════════════════════════════════════════════════════════════
-  let rafId = 0, running = true, needsRender = true, lastT = now(), contextLost = false;
+  let rafId = 0, pulseTimer = 0, running = true, needsRender = true, lastT = now(), contextLost = false;
 
   function requestRender() {
     needsRender = true;
+    if (pulseTimer) { clearTimeout(pulseTimer); pulseTimer = 0; }   // upgrade pulse-rate → now
     if (!rafId && running && !contextLost) rafId = requestAnimationFrame(frame);
   }
 
@@ -781,30 +860,29 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     processHover();
 
     // camera tween
-    let animating = false;
     if (tween) {
       const p = clamp((t - tween.t0) / tween.dur, 0, 1);
       const e = easeInOutCubic(p);
       camera.position.lerpVectors(tween.fromPos, tween.toPos, e);
       controls.target.lerpVectors(tween.fromTgt, tween.toTgt, e);
-      if (p >= 1) tween = null; else animating = true;
+      if (p >= 1) tween = null;
     }
 
     const controlsChanged = controls.update();
-    if (controlsChanged) animating = animating || false; // damping handled below
-
-    const pinsActive = updatePins(dt, t / 1000);
+    const { fading, pulseVisible } = updatePins(dt, t / 1000);
     const ghostActive = updateGhost(t / 1000);
     updateLabels();   // distance-based scale + fade (no continuous render needed)
 
-    renderer.render(scene, camera);
+    renderer.render(scene, camera);   // shadow map skipped unless needsUpdate set
 
-    // keep looping only while something is in motion
-    if (tween || pinsActive || ghostActive || controlsChanged || animating) {
+    // full-rate loop only while genuinely settling; else a 30fps pulse ticker
+    // (shadow-frozen) if a pin is pulsing on-screen; else stop entirely.
+    if (tween || controlsChanged || fading || ghostActive) {
       rafId = requestAnimationFrame(frame);
-    } else if (needsRender) {
-      needsRender = false;
-      // one settled frame already drawn
+    } else if (pulseVisible) {
+      pulseTimer = setTimeout(() => { pulseTimer = 0; if (running && !contextLost) rafId = requestAnimationFrame(frame); }, 33);
+    } else {
+      needsRender = false; // idle — no more frames until requestRender()
     }
   }
   // kick continuous frames while OrbitControls damping settles
@@ -814,6 +892,13 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   canvas.addEventListener('pointermove', onPointerMove, { passive: true });
   canvas.addEventListener('pointerdown', onPointerDown, { passive: true });
   canvas.addEventListener('pointerup', onPointerUp, { passive: true });
+
+  // ---- page visibility (pause pulse when tab hidden) -------------------
+  function onVisibility() {
+    pageVisible = document.visibilityState !== 'hidden';
+    if (pageVisible) { lastT = now(); requestRender(); }
+  }
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
 
   // ---- context loss ----------------------------------------------------
   function onContextLost(e) { e.preventDefault(); contextLost = true; if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } }
@@ -826,8 +911,16 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   function doResize() {
     const w = canvas.clientWidth || canvas.width || 1;
     const h = canvas.clientHeight || canvas.height || 1;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    const mobile = w < 800;                          // PERF: mobile budget
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, mobile ? 1.5 : 2));
     renderer.setSize(w, h, false);
+    // shadow map 1024 on small viewports, 2048 on desktop
+    const wantShadow = mobile ? 1024 : 2048;
+    if (sun.shadow.mapSize.x !== wantShadow) {
+      sun.shadow.mapSize.set(wantShadow, wantShadow);
+      if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+      sun.shadow.needsUpdate = true;
+    }
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     requestRender();
@@ -860,14 +953,14 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
         const pid = m.userData.propertyId;
         if (pid != null && openByProp.has(pid)) m.userData.openCount = openByProp.get(pid);
       });
-      requestRender();
+      requestShadowUpdate(); requestRender();   // pins changed → refresh frozen shadows
     },
 
     setTimeRange(fromMs, toMs) {
       timeFrom = (fromMs == null ? null : fromMs);
       timeTo = (toMs == null ? null : toMs);
       pinRecords.forEach(applyTimelineTo);
-      requestRender();
+      requestShadowUpdate(); requestRender();
     },
 
     focus(entityId) {
@@ -936,11 +1029,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     },
 
     showGhostPin(local) {
-      if (local == null) { if (ghost) ghost.group.visible = false; requestRender(); return; }
+      if (local == null) { if (ghost) ghost.group.visible = false; requestShadowUpdate(); requestRender(); return; }
       const g = ensureGhost();
       positionGhost(local[0], local[2]);
       g.group.visible = true;
-      requestRender();
+      requestShadowUpdate(); requestRender();
     },
     onGhostMoved(cb) { cbs.ghostMoved = typeof cb === 'function' ? cb : null; },
 
@@ -951,9 +1044,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
     dispose() {
       running = false;
       if (rafId) cancelAnimationFrame(rafId);
+      if (pulseTimer) clearTimeout(pulseTimer);
       clearTimeout(resizeTimer);
       controls.removeEventListener('change', requestRender);
       controls.removeEventListener('start', requestRender);
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointerup', onPointerUp);
@@ -1000,6 +1095,28 @@ async function fetchTerrain(url) {
   return parseTerrain(buf);
 }
 
+// contracts §2.1b — RLHM pre-decimated mesh (optional; null → grid fallback)
+async function fetchTerrainMesh(url) {
+  let res;
+  try { res = await fetch(url); } catch { return null; }
+  if (!res.ok) return null;
+  try { return parseTerrainMesh(await res.arrayBuffer()); } catch { return null; }
+}
+function parseTerrainMesh(buf) {
+  const dv = new DataView(buf);
+  const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+  if (magic !== 'RLHM') throw new Error(`bad terrain-mesh magic: ${magic}`);
+  const H = dv.getUint32(4, true);
+  const header = JSON.parse(new TextDecoder('utf-8').decode(new Uint8Array(buf, 8, H)));
+  const off = 8 + H;
+  const vBytes = header.vertCount * 8 * 4;          // 8 f32 per vertex (pos3,normal3,uv2)
+  const iBytes = header.triCount * 3 * 4;           // u32 indices
+  // slice → fresh 0-offset buffers (data offset may be non-4-aligned for f32)
+  const vertexData = new Float32Array(buf.slice(off, off + vBytes));
+  const indexData = new Uint32Array(buf.slice(off + vBytes, off + vBytes + iBytes));
+  return { header, vertexData, indexData };
+}
+
 // contracts §2.1 — RLHT binary
 function parseTerrain(buf) {
   const dv = new DataView(buf);
@@ -1027,7 +1144,7 @@ function parseTerrain(buf) {
 // ────────────────────────────────────────────────────────────────────────
 // terrain mesh + skirt + bilinear sampler
 // ────────────────────────────────────────────────────────────────────────
-function buildTerrain(terrain, geometries, materials, roadMesh) {
+function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
   const { header, heights, width, height } = terrain;
   const originE = header.originE, originN = header.originN, cell = header.cell;
   const x0 = header.minE - originE;
@@ -1042,48 +1159,11 @@ function buildTerrain(terrain, geometries, materials, roadMesh) {
   const sceneZ = r => z0 + r * cell;
   const at = (r, c) => { const v = heights[r * width + c]; return Number.isFinite(v) ? v : mean; };
 
-  // ---- adaptive (variance-decimated) surface geometry -----------------
-  // Full 2 m grid stays authoritative for sampleHeight/pick/ghost; only the
-  // RENDER mesh is decimated. Flat tiles → 2 triangles; detailed tiles keep
-  // full res (via one level of 8×8 quadrant subdivision). Normals come from
-  // the full grid so shading is identical across LOD levels. LOD skirts fill
-  // T-junction cracks at mixed-res borders.
-  const ERROR_T = 1.5;           // metres — open-fell flatness tolerance (tuned)
-  const TILE = 16;               // cells per tile
-  const HALF = TILE / 2;         // 8×8 quadrant
-  const SKIRT_DEPTH = 0.30;      // LOD crack skirt
-
-  // Recess-aware protection: a global flatness threshold cannot both decimate
-  // the bumpy fell AND preserve the 0.2 m road recesses (their signal is below
-  // any threshold big enough to flatten the fell). So mark grid cells the road
-  // passes through (±1 halo) and force those tiles full-res — recesses stay
-  // crisp while the open fell decimates hard. Buildings sink 2 m into terrain
-  // (foundation rule) so their contact is buried and needs no protection.
-  const prot = new Uint8Array(width * height);
-  if (roadMesh && roadMesh.positions) {
-    const P = roadMesh.positions;
-    for (let i = 0; i < P.length; i += 3) {
-      const c = Math.round((P[i] - x0) / cell), r = Math.round((P[i + 2] - z0) / cell);
-      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
-        const rr = r + dr, cc = c + dc;
-        if (rr >= 0 && rr < height && cc >= 0 && cc < width) prot[rr * width + cc] = 1;
-      }
-    }
-  }
-  function hasProt(r0, c0, r1, c1) {
-    for (let r = r0; r <= r1; r++) { const base = r * width; for (let c = c0; c <= c1; c++) if (prot[base + c]) return true; }
-    return false;
-  }
   const cCream = new THREE.Color(PAL.terrainCream);
   const cSage = new THREE.Color(PAL.terrainSage);
   const span = Math.max(1e-6, header.zMax - header.zMin);
-
-  const positions = [], normals = [], colors = [], indices = [];
-  const vmap = new Map();        // grid node r*width+c → vertex index (dedup)
-  const skirtPos = [], skirtNrm = [], skirtCol = [];
-
   const nodeColor = (y) => cCream.clone().lerp(cSage, clamp((y - header.zMin) / span, 0, 1) * 0.55);
-  function gridNormal(r, c) {    // analytic normal from full grid (smooth, LOD-invariant)
+  function gridNormal(r, c) {    // analytic normal from full grid (central diffs)
     const cL = Math.max(0, c - 1), cR = Math.min(width - 1, c + 1);
     const rU = Math.max(0, r - 1), rD = Math.min(height - 1, r + 1);
     const hx = (at(r, cR) - at(r, cL)) / (cR - cL || 1);
@@ -1092,119 +1172,73 @@ function buildTerrain(terrain, geometries, materials, roadMesh) {
     const l = Math.hypot(nx, ny, nz) || 1;
     return [nx / l, ny / l, nz / l];
   }
-  function addV(r, c) {
-    const key = r * width + c;
-    let vi = vmap.get(key);
-    if (vi !== undefined) return vi;
-    vi = positions.length / 3;
-    const y = at(r, c);
-    positions.push(sceneX(c), y, sceneZ(r));
-    const nrm = gridNormal(r, c); normals.push(nrm[0], nrm[1], nrm[2]);
-    const cc = nodeColor(y); colors.push(cc.r, cc.g, cc.b);
-    vmap.set(key, vi);
-    return vi;
+
+  // ---- render mesh (contracts §2.1b) ----------------------------------
+  // Prefer the pre-decimated continuous mesh (RLHM): watertight, organic
+  // boundary, no facet seams/skirts. Fall back to a full-res grid mesh (with
+  // full-grid normals + planar UVs) if the bake isn't present. The full 2 m
+  // grid remains authoritative for sampleHeight/pick/ghost either way.
+  function geoFromRLHM(md) {
+    const g = new THREE.BufferGeometry();
+    const ib = new THREE.InterleavedBuffer(md.vertexData, 8); // [pos3, normal3, uv2]
+    g.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0));
+    g.setAttribute('normal', new THREE.InterleavedBufferAttribute(ib, 3, 3));
+    g.setAttribute('uv', new THREE.InterleavedBufferAttribute(ib, 2, 6));
+    g.setIndex(new THREE.BufferAttribute(md.indexData, 1));
+    g.computeBoundingSphere();
+    return g;
   }
-  function quad(r0, c0, r1, c1) {
-    const a = addV(r0, c0), b = addV(r0, c1), d = addV(r1, c0), e = addV(r1, c1);
-    indices.push(a, d, b, b, d, e);
-  }
-  function fullRes(r0, c0, r1, c1) {
-    for (let r = r0; r < r1; r++) for (let c = c0; c < c1; c++) {
-      const a = addV(r, c), b = addV(r, c + 1), d = addV(r + 1, c), e = addV(r + 1, c + 1);
+  function buildFullGridGeo() {
+    const positions = [], normals = [], colors = [], uvs = [], indices = [];
+    for (let r = 0; r < height; r++) for (let c = 0; c < width; c++) {
+      const y = at(r, c);
+      positions.push(sceneX(c), y, sceneZ(r));
+      const nn = gridNormal(r, c); normals.push(nn[0], nn[1], nn[2]);
+      const cc = nodeColor(y); colors.push(cc.r, cc.g, cc.b);
+      uvs.push(c / (width - 1), 1 - r / (height - 1));  // north row → v=1
+    }
+    for (let r = 0; r < height - 1; r++) for (let c = 0; c < width - 1; c++) {
+      const a = r * width + c, b = a + 1, d = a + width, e = d + 1;
       indices.push(a, d, b, b, d, e);
     }
-  }
-  function regionError(r0, c0, r1, c1) {
-    const dr = r1 - r0, dc = c1 - c0;
-    if (dr <= 1 && dc <= 1) return 0;
-    const h00 = at(r0, c0), h01 = at(r0, c1), h10 = at(r1, c0), h11 = at(r1, c1);
-    let maxE = 0;
-    for (let r = r0; r <= r1; r++) {
-      const tz = (r - r0) / dr;
-      for (let c = c0; c <= c1; c++) {
-        const tx = (c - c0) / dc;
-        const bil = (h00 * (1 - tx) + h01 * tx) * (1 - tz) + (h10 * (1 - tx) + h11 * tx) * tz;
-        const e = Math.abs(at(r, c) - bil);
-        if (e > maxE) maxE = e;
-      }
-    }
-    return maxE;
-  }
-  function skirtEdge(ra, ca, rb, cb, ox, oz) {
-    const ax = sceneX(ca), az = sceneZ(ra), ay = at(ra, ca);
-    const bx = sceneX(cb), bz = sceneZ(rb), by = at(rb, cb);
-    const cA = nodeColor(ay), cB = nodeColor(by);
-    const P = (x, y, z, cc) => { skirtPos.push(x, y, z); skirtNrm.push(ox, 0, oz); skirtCol.push(cc.r, cc.g, cc.b); };
-    P(ax, ay, az, cA); P(bx, by, bz, cB); P(ax, ay - SKIRT_DEPTH, az, cA);
-    P(bx, by, bz, cB); P(bx, by - SKIRT_DEPTH, bz, cB); P(ax, ay - SKIRT_DEPTH, az, cA);
-  }
-  function decimate(r0, c0, r1, c1) {
-    quad(r0, c0, r1, c1);
-    skirtEdge(r0, c0, r0, c1, 0, -1);   // north
-    skirtEdge(r1, c1, r1, c0, 0, 1);    // south
-    skirtEdge(r1, c0, r0, c0, -1, 0);   // west
-    skirtEdge(r0, c1, r1, c1, 1, 0);    // east
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    g.setIndex(positions.length / 3 > 65535 ? new THREE.Uint32BufferAttribute(indices, 1) : new THREE.Uint16BufferAttribute(indices, 1));
+    return g;
   }
 
-  let nDec = 0, nFull = 0;
-  for (let r0 = 0; r0 < height - 1; r0 += TILE) {
-    const r1 = Math.min(r0 + TILE, height - 1);
-    for (let c0 = 0; c0 < width - 1; c0 += TILE) {
-      const c1 = Math.min(c0 + TILE, width - 1);
-      if (!hasProt(r0, c0, r1, c1) && regionError(r0, c0, r1, c1) < ERROR_T) { decimate(r0, c0, r1, c1); nDec++; }
-      else {
-        const rM = Math.min(r0 + HALF, r1), cM = Math.min(c0 + HALF, c1);
-        for (const q of [[r0, c0, rM, cM], [r0, cM, rM, c1], [rM, c0, r1, cM], [rM, cM, r1, c1]]) {
-          const [qr0, qc0, qr1, qc1] = q;
-          if (qr1 <= qr0 || qc1 <= qc0) continue;   // edge remainder
-          if (!hasProt(qr0, qc0, qr1, qc1) && regionError(qr0, qc0, qr1, qc1) < ERROR_T) { decimate(qr0, qc0, qr1, qc1); nDec++; }
-          else { fullRes(qr0, qc0, qr1, qc1); nFull++; }
-        }
-      }
-    }
-  }
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  const vCount = positions.length / 3;
-  geo.setIndex(vCount > 65535 ? new THREE.Uint32BufferAttribute(indices, 1) : new THREE.Uint16BufferAttribute(indices, 1));
+  const usedMesh = !!meshData;
+  const geo = usedMesh ? geoFromRLHM(meshData) : buildFullGridGeo();
   geometries.add(geo);
+  const renderTris = usedMesh ? meshData.header.triCount : geo.getIndex().count / 3;
 
   const mat = new THREE.MeshStandardMaterial({
-    vertexColors: true, roughness: 0.98, metalness: 0.0, flatShading: false,
+    color: PAL.terrainCream,          // cream base before albedo loads
+    vertexColors: !usedMesh,          // grid fallback carries height-tint; RLHM uses base + albedo
+    roughness: 0.98, metalness: 0.0, flatShading: false,
   });
   materials.add(mat);
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   mesh.castShadow = false;
 
-  // LOD crack skirts (terrain-coloured curtains at decimated tile edges)
-  let lodSkirt = null;
-  if (skirtPos.length) {
-    const sg = new THREE.BufferGeometry();
-    sg.setAttribute('position', new THREE.Float32BufferAttribute(skirtPos, 3));
-    sg.setAttribute('normal', new THREE.Float32BufferAttribute(skirtNrm, 3));
-    sg.setAttribute('color', new THREE.Float32BufferAttribute(skirtCol, 3));
-    geometries.add(sg);
-    const sm = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.98, metalness: 0, side: THREE.DoubleSide });
-    materials.add(sm);
-    lodSkirt = new THREE.Mesh(sg, sm);
-    lodSkirt.receiveShadow = true; lodSkirt.castShadow = false;
-  }
-
-  const fullTris = (width - 1) * (height - 1) * 2;
-  const renderTris = indices.length / 3;
-  const skirtTris = skirtPos.length / 9;
   if (typeof console !== 'undefined') {
-    console.info(`[scene] terrain LOD: full=${fullTris} render=${renderTris} +skirt=${skirtTris} ` +
-      `(${(100 * (1 - renderTris / fullTris)).toFixed(1)}% reduction) ERROR_T=${ERROR_T} decTiles=${nDec} fullTiles=${nFull}`);
+    console.info(`[scene] terrain: ${usedMesh ? 'RLHM pre-decimated' : 'full-grid fallback'} — ${renderTris} tris`);
   }
 
-  // ---- skirt (plinth) : vertical walls around the boundary + bottom cap
+  // ---- plinth skirt ---------------------------------------------------
+  // Island mesh (§2.1b rev 4a): the boundary is organic (corner trims), so a
+  // rectangular plinth would mismatch. Instead hug the ACTUAL mesh boundary —
+  // extrude the boundary edges (used by one triangle) straight down. This turns
+  // any visible boundary into an intentional model edge, not a torn cut.
+  // Full-grid fallback keeps the rectangular plinth (its boundary IS the rect).
   const baseY = header.zMin - Math.max(8, (header.zMax - header.zMin) * 0.4);
-  const skirt = buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials);
+  const skirt = usedMesh
+    ? buildBoundaryPlinth(meshData, baseY, geometries, materials)
+    : buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials);
 
   // ---- bilinear sampler in scene coords ----
   function sampleHeight(x, z) {
@@ -1218,7 +1252,50 @@ function buildTerrain(terrain, geometries, materials, roadMesh) {
     return lerp(lerp(h00, h10, tx), lerp(h01, h11, tx), tz);
   }
 
-  return { mesh, skirt, lodSkirt, sampleHeight };
+  return { mesh, skirt, sampleHeight };
+}
+
+// Plinth that hugs the RLHM mesh's actual boundary (organic island). Boundary
+// edges = edges referenced by exactly one triangle; extrude each down to baseY.
+function buildBoundaryPlinth(md, baseY, geometries, materials) {
+  const idx = md.indexData, vd = md.vertexData, S = 8;
+  const key = (a, b) => (a < b ? a * 8388608 + b : b * 8388608 + a); // verts < 8.4M
+  const count = new Map();
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = idx[t], b = idx[t + 1], c = idx[t + 2];
+    count.set(key(a, b), (count.get(key(a, b)) || 0) + 1);
+    count.set(key(b, c), (count.get(key(b, c)) || 0) + 1);
+    count.set(key(c, a), (count.get(key(c, a)) || 0) + 1);
+  }
+  const pos = [], col = [];
+  const cTop = new THREE.Color(PAL.skirt), cBot = new THREE.Color(PAL.skirtBottom);
+  const emit = (i, j) => {
+    const ix = vd[i * S], iy = vd[i * S + 1], iz = vd[i * S + 2];
+    const jx = vd[j * S], jy = vd[j * S + 1], jz = vd[j * S + 2];
+    // two tris: (i, j, i↓) and (j, j↓, i↓)
+    pos.push(ix, iy, iz, jx, jy, jz, ix, baseY, iz);
+    pos.push(jx, jy, jz, jx, baseY, jz, ix, baseY, iz);
+    for (let q = 0; q < 2; q++) { col.push(cTop.r, cTop.g, cTop.b); }
+    col.push(cBot.r, cBot.g, cBot.b);
+    col.push(cTop.r, cTop.g, cTop.b);
+    for (let q = 0; q < 2; q++) { col.push(cBot.r, cBot.g, cBot.b); }
+  };
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = idx[t], b = idx[t + 1], c = idx[t + 2];
+    if (count.get(key(a, b)) === 1) emit(a, b);
+    if (count.get(key(b, c)) === 1) emit(b, c);
+    if (count.get(key(c, a)) === 1) emit(c, a);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  geometries.add(g);
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1.0, metalness: 0, side: THREE.DoubleSide });
+  materials.add(m);
+  const mesh = new THREE.Mesh(g, m);
+  mesh.receiveShadow = true; mesh.castShadow = false;
+  return mesh;
 }
 
 function buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials) {
@@ -1269,9 +1346,7 @@ function buildBuildings(data, ctx) {
   const make = (b, labelled) => {
     const fp = b.footprint;
     if (!fp || fp.length < 3) return;
-    // sample ground at every footprint vertex + centroid (owner rule):
-    //   base y = min(samples) − 2.0m  (foundation sink → glued into the hill)
-    //   top  y = mean(samples) + height (eaves still read correctly vs ground)
+    // sample ground at every footprint vertex + centroid; top = mean + height.
     let cx = 0, cz = 0;
     const samples = [];
     for (const [px, pz] of fp) {
@@ -1283,9 +1358,20 @@ function buildBuildings(data, ctx) {
     const cg = sampleHeight(cx, cz);
     if (Number.isFinite(cg)) samples.push(cg);
     if (!samples.length) samples.push(0);
-    const minS = Math.min(...samples);
     const meanS = samples.reduce((a, v) => a + v, 0) / samples.length;
-    const base = minS - 2.0;                     // foundation sink
+
+    // P2: also sample a ring pushed OUTWARD from the centroid past each vertex
+    // to catch terrain that falls away downhill just beyond the footprint, so
+    // the base sinks below it and no cuboid underside floats on steep sites.
+    const outer = [];
+    for (const [px, pz] of fp) {
+      let dx = px - cx, dz = pz - cz; const L = Math.hypot(dx, dz) || 1;
+      dx /= L; dz /= L;
+      const og = sampleHeight(px + dx * 5, pz + dz * 5);   // 5 m outward
+      if (Number.isFinite(og)) outer.push(og);
+    }
+    const minOuter = outer.length ? Math.min(...outer, ...samples) : Math.min(...samples);
+    const base = minOuter - 3.0;                 // deeper foundation sink vs surrounding ground
     const top = meanS + (b.height || 5);         // eaves above mean ground
     const depth = Math.max(top - base, 1.0);
 
@@ -1391,11 +1477,13 @@ function nearestOnSeg(px, pz, ax, az, bx, bz) {
 // via addGroup so it stays a single draw-friendly mesh.
 // ────────────────────────────────────────────────────────────────────────
 const ROAD_KINDS = ['randlehow', 'public', 'track', 'path'];
+// P0: darkened so the ribbon reads clearly against the cream terrain,
+// hierarchy preserved (hero → cooler public → muted earthy track/path)
 const ROAD_TINT = {
-  randlehow: 0xc4bca8, // hero — lighter/warmer than base grey
-  public:    0xa9a89e, // a touch darker/cooler
-  track:     0xa8977f, // muted earthy
-  path:      0xbdb6a8, // faintest, near-terrain
+  randlehow: 0x8f8672, // hero — clearly darker/warmer than terrain
+  public:    0x7d7869, // darker + cooler
+  track:     0x8a7d64, // muted earthy
+  path:      0x9a9080, // faintest, most muted
 };
 function buildRoad(roadMesh, geometries, materials) {
   const geo = new THREE.BufferGeometry();

@@ -153,8 +153,9 @@ function synthIssues(roadMesh) {
   const day = 864e5;
   const t0 = Date.parse('2024-06-01');
   const out = [];
-  const picks = [0.12, 0.3, 0.48, 0.62, 0.78, 0.9];
-  picks.forEach((f, i) => {
+  const COUNT = 28;                      // audit density check
+  for (let i = 0; i < COUNT; i++) {
+    const f = (i + 0.5) / COUNT;         // spread evenly along the ribbon
     const vi = Math.floor(f * (n - 1));
     const x = p[vi * 3], y = p[vi * 3 + 1], z = p[vi * 3 + 2];
     const status = stats[i % stats.length];
@@ -163,10 +164,10 @@ function synthIssues(roadMesh) {
       id: `synth-${i}`, category: cats[i % 3], severity: sevs[i % 3], status,
       title: `Synthetic ${cats[i % 3]} issue ${i + 1}`,
       local: [x, y, z],
-      reportedAtMs: t0 + i * 90 * day,
-      fixedAtMs: fixed ? t0 + (i * 90 + 45) * day : null,
+      reportedAtMs: t0 + i * 28 * day,
+      fixedAtMs: fixed ? t0 + (i * 28 + 20) * day : null,
     });
-  });
+  }
   return out;
 }
 
