@@ -285,7 +285,6 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   scene.add(terrainMesh.mesh);
   if (terrainMesh.skirt) scene.add(terrainMesh.skirt);
   const sampleHeight = terrainMesh.sampleHeight;
-  if (typeof window !== 'undefined') window.__rlhwDebug = { scene, camera, terrainMesh: terrainMesh.mesh }; // TEMP debug
 
   // terrain-albedo.png (contracts §2.1a): baked cream + road paint, solves
   // subpixel ribbon aliasing at overview. Sibling of terrain.bin. Applied as
@@ -293,6 +292,8 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // Ribbon meshes stay for close range / picking / snapping.
   const albedoUrl = terrainUrl.replace(/[^/]+$/, 'terrain-albedo.png');
   new THREE.TextureLoader().load(albedoUrl, (tex) => {
+    tex.flipY = false;  // bake paints v=0 at the north edge; the loader's
+                        // default vertical flip mirrored the roads N-S
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
     tex.generateMipmaps = true;
@@ -830,7 +831,9 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
 
   function frame() {
     rafId = 0;
-    if (!running || contextLost || !pageVisible) return;
+    if (!running || contextLost) return;
+    // NOTE: no visibility pause here — the browser already throttles rAF in
+    // hidden tabs; a manual pause caused stale frames when the tab flapped.
     const t = now();
     const dt = Math.min((t - lastT) / 1000, 0.1);
     lastT = t;
@@ -856,7 +859,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   // requestRender = "ensure the loop is running" (idempotent). Kept as a name so
   // existing call sites still work; the loop runs continuously while visible.
   function requestRender() {
-    if (!rafId && running && !contextLost && pageVisible) rafId = requestAnimationFrame(frame);
+    if (!rafId && running && !contextLost) rafId = requestAnimationFrame(frame);
   }
 
   canvas.addEventListener('pointermove', onPointerMove, { passive: true });
@@ -1153,7 +1156,17 @@ function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
     g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-    g.setIndex(new THREE.BufferAttribute(md.indexData, 1));
+    // The bake's local frame (x=E−oE, z=−(N−oN)) mirrors handedness, so the
+    // exported triangles wind CW when viewed from above — three.js then culls
+    // the top surface as back-faces (and DoubleSide lights it dark). Reverse
+    // the winding on ingest so the top is front-facing under FrontSide.
+    // Live-verified 2026-09-01: this + flipY=false is what makes the terrain
+    // light correctly and the albedo roads land on the right ground.
+    const idx = md.indexData;
+    for (let t = 0; t < idx.length; t += 3) {
+      const b = idx[t + 1]; idx[t + 1] = idx[t + 2]; idx[t + 2] = b;
+    }
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
     g.computeBoundingSphere();
     g.computeBoundingBox();
     return g;
