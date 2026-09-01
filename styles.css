@@ -145,7 +145,7 @@ a { color: var(--sage-deep); }
 }
 .side.expanded { height: min(78dvh, 640px); }
 .app.editing .side { bottom: calc(64px + env(safe-area-inset-bottom)); }
-.sheet-grip { display: flex; justify-content: center; align-items: center; height: 26px; border: none; background: transparent; cursor: pointer; width: 100%; }
+.sheet-grip { display: flex; justify-content: center; align-items: center; min-height: 44px; height: 44px; border: none; background: transparent; cursor: pointer; width: 100%; }
 .grip-bar { width: 42px; height: 5px; border-radius: 3px; background: var(--hairline); }
 
 /* ── Tabs ────────────────────────────────────────────────────────────────── */
@@ -429,7 +429,8 @@ code { background: var(--panel); padding: 1px 5px; border-radius: 4px; font-size
 
 /* Larger touch targets for form controls on phones (≥44px). */
 @media (max-width: 767px) {
-  .select, .btn-ghost, .tab, .issue-row, .link-chip, .doc-link { min-height: 44px; }
+  .select, .btn-ghost, .tab, .issue-row, .link-chip, .doc-link,
+  .forget-btn, .date-input, .timeline-bar .btn-ghost { min-height: 44px; }
   .filter-bar .select { min-height: 44px; font-size: 14px; }
   .close-x { width: 44px; height: 44px; }
 }

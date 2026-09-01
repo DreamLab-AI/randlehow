@@ -280,6 +280,7 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
   const terrainMesh = buildTerrain(terrain, geometries, materials);
   scene.add(terrainMesh.mesh);
   scene.add(terrainMesh.skirt);
+  if (terrainMesh.lodSkirt) scene.add(terrainMesh.lodSkirt);
   const sampleHeight = terrainMesh.sampleHeight;
 
   // ---- background fog blends model edge into paper ---------------------
@@ -703,8 +704,11 @@ export async function initScene(canvas, { terrainUrl, buildings, roadMesh }) {
       const hits = raycaster.intersectObjects(pickTargetsTerrain, false);
       if (hits.length && cbs.pick) {
         const p = hits[0].point;
+        // refine y from the FULL grid (render mesh is decimated)
+        const gy = sampleHeight(p.x, p.z);
+        const y = Number.isFinite(gy) ? gy : p.y;
         const E = p.x + originE, N = originN - p.z;
-        cbs.pick({ local: [p.x, p.y, p.z], wgs84: eastNorthToWgs84(E, N) });
+        cbs.pick({ local: [p.x, y, p.z], wgs84: eastNorthToWgs84(E, N) });
       }
       return;
     }
@@ -1038,37 +1042,112 @@ function buildTerrain(terrain, geometries, materials) {
   const sceneZ = r => z0 + r * cell;
   const at = (r, c) => { const v = heights[r * width + c]; return Number.isFinite(v) ? v : mean; };
 
-  // ---- surface geometry ----
-  const vcount = width * height;
-  const pos = new Float32Array(vcount * 3);
-  const col = new Float32Array(vcount * 3);
+  // ---- adaptive (variance-decimated) surface geometry -----------------
+  // Full 2 m grid stays authoritative for sampleHeight/pick/ghost; only the
+  // RENDER mesh is decimated. Flat tiles → 2 triangles; detailed tiles keep
+  // full res (via one level of 8×8 quadrant subdivision). Normals come from
+  // the full grid so shading is identical across LOD levels. LOD skirts fill
+  // T-junction cracks at mixed-res borders.
+  const ERROR_T = 0.10;          // metres — tile flatness tolerance
+  const TILE = 16;               // cells per tile
+  const HALF = TILE / 2;         // 8×8 quadrant
+  const SKIRT_DEPTH = 0.30;      // LOD crack skirt
   const cCream = new THREE.Color(PAL.terrainCream);
   const cSage = new THREE.Color(PAL.terrainSage);
   const span = Math.max(1e-6, header.zMax - header.zMin);
-  for (let r = 0; r < height; r++) {
-    for (let c = 0; c < width; c++) {
-      const i = r * width + c;
-      const y = at(r, c);
-      pos[i * 3] = sceneX(c);
-      pos[i * 3 + 1] = y;
-      pos[i * 3 + 2] = sceneZ(r);
-      const tint = clamp((y - header.zMin) / span, 0, 1) * 0.55; // subtle
-      const cc = cCream.clone().lerp(cSage, tint);
-      col[i * 3] = cc.r; col[i * 3 + 1] = cc.g; col[i * 3 + 2] = cc.b;
+
+  const positions = [], normals = [], colors = [], indices = [];
+  const vmap = new Map();        // grid node r*width+c → vertex index (dedup)
+  const skirtPos = [], skirtNrm = [], skirtCol = [];
+
+  const nodeColor = (y) => cCream.clone().lerp(cSage, clamp((y - header.zMin) / span, 0, 1) * 0.55);
+  function gridNormal(r, c) {    // analytic normal from full grid (smooth, LOD-invariant)
+    const cL = Math.max(0, c - 1), cR = Math.min(width - 1, c + 1);
+    const rU = Math.max(0, r - 1), rD = Math.min(height - 1, r + 1);
+    const hx = (at(r, cR) - at(r, cL)) / (cR - cL || 1);
+    const hz = (at(rD, c) - at(rU, c)) / (rD - rU || 1);
+    const nx = -hx, ny = cell, nz = -hz;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    return [nx / l, ny / l, nz / l];
+  }
+  function addV(r, c) {
+    const key = r * width + c;
+    let vi = vmap.get(key);
+    if (vi !== undefined) return vi;
+    vi = positions.length / 3;
+    const y = at(r, c);
+    positions.push(sceneX(c), y, sceneZ(r));
+    const nrm = gridNormal(r, c); normals.push(nrm[0], nrm[1], nrm[2]);
+    const cc = nodeColor(y); colors.push(cc.r, cc.g, cc.b);
+    vmap.set(key, vi);
+    return vi;
+  }
+  function quad(r0, c0, r1, c1) {
+    const a = addV(r0, c0), b = addV(r0, c1), d = addV(r1, c0), e = addV(r1, c1);
+    indices.push(a, d, b, b, d, e);
+  }
+  function fullRes(r0, c0, r1, c1) {
+    for (let r = r0; r < r1; r++) for (let c = c0; c < c1; c++) {
+      const a = addV(r, c), b = addV(r, c + 1), d = addV(r + 1, c), e = addV(r + 1, c + 1);
+      indices.push(a, d, b, b, d, e);
     }
   }
-  const idx = [];
-  for (let r = 0; r < height - 1; r++) {
-    for (let c = 0; c < width - 1; c++) {
-      const a = r * width + c, b = a + 1, d = a + width, e = d + 1;
-      idx.push(a, d, b, b, d, e);
+  function regionError(r0, c0, r1, c1) {
+    const dr = r1 - r0, dc = c1 - c0;
+    if (dr <= 1 && dc <= 1) return 0;
+    const h00 = at(r0, c0), h01 = at(r0, c1), h10 = at(r1, c0), h11 = at(r1, c1);
+    let maxE = 0;
+    for (let r = r0; r <= r1; r++) {
+      const tz = (r - r0) / dr;
+      for (let c = c0; c <= c1; c++) {
+        const tx = (c - c0) / dc;
+        const bil = (h00 * (1 - tx) + h01 * tx) * (1 - tz) + (h10 * (1 - tx) + h11 * tx) * tz;
+        const e = Math.abs(at(r, c) - bil);
+        if (e > maxE) maxE = e;
+      }
+    }
+    return maxE;
+  }
+  function skirtEdge(ra, ca, rb, cb, ox, oz) {
+    const ax = sceneX(ca), az = sceneZ(ra), ay = at(ra, ca);
+    const bx = sceneX(cb), bz = sceneZ(rb), by = at(rb, cb);
+    const cA = nodeColor(ay), cB = nodeColor(by);
+    const P = (x, y, z, cc) => { skirtPos.push(x, y, z); skirtNrm.push(ox, 0, oz); skirtCol.push(cc.r, cc.g, cc.b); };
+    P(ax, ay, az, cA); P(bx, by, bz, cB); P(ax, ay - SKIRT_DEPTH, az, cA);
+    P(bx, by, bz, cB); P(bx, by - SKIRT_DEPTH, bz, cB); P(ax, ay - SKIRT_DEPTH, az, cA);
+  }
+  function decimate(r0, c0, r1, c1) {
+    quad(r0, c0, r1, c1);
+    skirtEdge(r0, c0, r0, c1, 0, -1);   // north
+    skirtEdge(r1, c1, r1, c0, 0, 1);    // south
+    skirtEdge(r1, c0, r0, c0, -1, 0);   // west
+    skirtEdge(r0, c1, r1, c1, 1, 0);    // east
+  }
+
+  let nDec = 0, nFull = 0;
+  for (let r0 = 0; r0 < height - 1; r0 += TILE) {
+    const r1 = Math.min(r0 + TILE, height - 1);
+    for (let c0 = 0; c0 < width - 1; c0 += TILE) {
+      const c1 = Math.min(c0 + TILE, width - 1);
+      if (regionError(r0, c0, r1, c1) < ERROR_T) { decimate(r0, c0, r1, c1); nDec++; }
+      else {
+        const rM = Math.min(r0 + HALF, r1), cM = Math.min(c0 + HALF, c1);
+        for (const q of [[r0, c0, rM, cM], [r0, cM, rM, c1], [rM, c0, r1, cM], [rM, cM, r1, c1]]) {
+          const [qr0, qc0, qr1, qc1] = q;
+          if (qr1 <= qr0 || qc1 <= qc0) continue;   // edge remainder
+          if (regionError(qr0, qc0, qr1, qc1) < ERROR_T) { decimate(qr0, qc0, qr1, qc1); nDec++; }
+          else { fullRes(qr0, qc0, qr1, qc1); nFull++; }
+        }
+      }
     }
   }
+
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  geo.setIndex(idx.length > 65535 ? new THREE.Uint32BufferAttribute(idx, 1) : new THREE.Uint16BufferAttribute(idx, 1));
-  geo.computeVertexNormals();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  const vCount = positions.length / 3;
+  geo.setIndex(vCount > 65535 ? new THREE.Uint32BufferAttribute(indices, 1) : new THREE.Uint16BufferAttribute(indices, 1));
   geometries.add(geo);
 
   const mat = new THREE.MeshStandardMaterial({
@@ -1078,6 +1157,28 @@ function buildTerrain(terrain, geometries, materials) {
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   mesh.castShadow = false;
+
+  // LOD crack skirts (terrain-coloured curtains at decimated tile edges)
+  let lodSkirt = null;
+  if (skirtPos.length) {
+    const sg = new THREE.BufferGeometry();
+    sg.setAttribute('position', new THREE.Float32BufferAttribute(skirtPos, 3));
+    sg.setAttribute('normal', new THREE.Float32BufferAttribute(skirtNrm, 3));
+    sg.setAttribute('color', new THREE.Float32BufferAttribute(skirtCol, 3));
+    geometries.add(sg);
+    const sm = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.98, metalness: 0, side: THREE.DoubleSide });
+    materials.add(sm);
+    lodSkirt = new THREE.Mesh(sg, sm);
+    lodSkirt.receiveShadow = true; lodSkirt.castShadow = false;
+  }
+
+  const fullTris = (width - 1) * (height - 1) * 2;
+  const renderTris = indices.length / 3;
+  const skirtTris = skirtPos.length / 9;
+  if (typeof console !== 'undefined') {
+    console.info(`[scene] terrain LOD: full=${fullTris} render=${renderTris} +skirt=${skirtTris} ` +
+      `(${(100 * (1 - renderTris / fullTris)).toFixed(1)}% reduction) ERROR_T=${ERROR_T} decTiles=${nDec} fullTiles=${nFull}`);
+  }
 
   // ---- skirt (plinth) : vertical walls around the boundary + bottom cap
   const baseY = header.zMin - Math.max(8, (header.zMax - header.zMin) * 0.4);
@@ -1095,7 +1196,7 @@ function buildTerrain(terrain, geometries, materials) {
     return lerp(lerp(h00, h10, tx), lerp(h01, h11, tx), tz);
   }
 
-  return { mesh, skirt, sampleHeight };
+  return { mesh, skirt, lodSkirt, sampleHeight };
 }
 
 function buildSkirt({ width, height, at, sceneX, sceneZ, baseY }, geometries, materials) {
