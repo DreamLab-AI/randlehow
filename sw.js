@@ -12,7 +12,7 @@
 // the one transitional load (old code + new data) is caught by the app's
 // stale-client "please refresh" notice and self-heals on reload.
 
-const BUILD = '2026-09-01T13:41:11Z';
+const BUILD = '2026-09-01T13:48:25Z';
 const CACHE = 'rlhw-' + BUILD;
 
 // Build-stamped code that is safe to cache (never the encrypted data).

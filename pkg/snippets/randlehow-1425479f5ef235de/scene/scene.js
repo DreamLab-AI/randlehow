@@ -1202,6 +1202,9 @@ function buildTerrain(terrain, geometries, materials, roadMesh, meshData) {
     color: PAL.terrainCream,          // cream base before albedo loads
     vertexColors: !usedMesh,          // grid fallback carries height-tint; RLHM uses base + albedo
     roughness: 0.98, metalness: 0.0, flatShading: false,
+    // Winding is corrected on ingest (geoFromRLHM reverses the CW export), so
+    // FrontSide renders + raycasts the top correctly. (Do NOT use DoubleSide —
+    // it lights the underside dark and bleeds through.)
   });
   materials.add(mat);
   const mesh = new THREE.Mesh(geo, mat);
