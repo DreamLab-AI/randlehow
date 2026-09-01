@@ -1358,21 +1358,14 @@ function buildBuildings(data, ctx) {
     const cg = sampleHeight(cx, cz);
     if (Number.isFinite(cg)) samples.push(cg);
     if (!samples.length) samples.push(0);
+    const minS = Math.min(...samples);
     const meanS = samples.reduce((a, v) => a + v, 0) / samples.length;
-
-    // P2: also sample a ring pushed OUTWARD from the centroid past each vertex
-    // to catch terrain that falls away downhill just beyond the footprint, so
-    // the base sinks below it and no cuboid underside floats on steep sites.
-    const outer = [];
-    for (const [px, pz] of fp) {
-      let dx = px - cx, dz = pz - cz; const L = Math.hypot(dx, dz) || 1;
-      dx /= L; dz /= L;
-      const og = sampleHeight(px + dx * 5, pz + dz * 5);   // 5 m outward
-      if (Number.isFinite(og)) outer.push(og);
-    }
-    const minOuter = outer.length ? Math.min(...outer, ...samples) : Math.min(...samples);
-    const base = minOuter - 3.0;                 // deeper foundation sink vs surrounding ground
-    const top = meanS + (b.height || 5);         // eaves above mean ground
+    // REVERTED to the first foundation-sink (verified clean): base = min − 2.0,
+    // top = mean + height, straight extrusion, flat roof. The v2 outward-ring
+    // + −3.0 sink was reverted — it was implicated in a wedge/slanted-massing
+    // regression on the live site. Do NOT reintroduce the outward ring here.
+    const base = minS - 2.0;
+    const top = meanS + (b.height || 5);
     const depth = Math.max(top - base, 1.0);
 
     const shape = new THREE.Shape();
